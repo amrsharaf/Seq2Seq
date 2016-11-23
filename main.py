@@ -11,9 +11,11 @@ from chainer.functions.loss import softmax_cross_entropy
 from chainer.training import extensions
 from iterator import Seq2SeqIterator
 import numpy as np
+import cupy as cp
 from chainer import reporter
 from nltk.translate.bleu_score import sentence_bleu
 from nltk.translate.bleu_score import corpus_bleu
+from nltk.translate.bleu_score import SmoothingFunction
 from operator import truth
 
 class LstmEncoder(Chain):
@@ -45,14 +47,16 @@ class LstmDecoder(Chain):
       if word_id >= n_words:
         continue
       scores = word_id_batch[word, :]
-      valid_scores = np.take(scores.data, valids[word_id:n_words])
+      valid_scores = np.take(scores, valids[word_id:n_words])
       max_id = np.argmax(valid_scores)
-      selection = valids[word_id:n_words][max_id]
+      real_valids = valids[word_id:n_words]
+      selection = np.take(real_valids, max_id)
       predictions[word, word_id] = selection
       # swap
       tmp = valid_ids[word, word_id]
       valid_ids[word, word_id] = selection
-      valid_ids[word, max_id + word_id] = tmp
+      new_index = max_id + word_id
+      valid_ids[word, new_index] = tmp
 
   def get_bleu(self, truth, prediction):
     assert(truth.shape == prediction.shape)
@@ -62,22 +66,25 @@ class LstmDecoder(Chain):
       n_words = sum(truth[sentence, :] != 0)
       reference =  truth[sentence, 0:n_words]
       hypothesis = prediction[sentence, 0:n_words]
-      bleu += sentence_bleu([[str(x) for x in reference.tolist()]], [str(x) for x in hypothesis.tolist()])
+      print 'ref: ', reference
+      print 'hyp: ', hypothesis
+      chencherry = SmoothingFunction()
+      bleu += sentence_bleu([[str(x) for x in reference.tolist()]], [str(x) for x in hypothesis.tolist()], smoothing_function=chencherry.method2)
     return bleu * (1.0 / batch_size)
-    
+
   def __call__(self, x, y):
     self.lstm.reset_state()
     loss = 0
     decode_length = y.shape[1]
     # TODO: convert to cupy
-    valid_ids = np.array(y.data)
+    valid_ids = cp.asnumpy(y.data)
     predictions = np.zeros_like(valid_ids)
     for word_id in range(decode_length):
       word_batch = self.lstm(x)
       word_id_batch = self.lin(word_batch)
       truth = y[:, word_id]
       loss += softmax_cross_entropy.softmax_cross_entropy(word_id_batch, truth)
-      self.get_prediction(word_id, valid_ids, word_id_batch, predictions)
+      self.get_prediction(word_id, valid_ids, cp.asnumpy(word_id_batch.data), predictions)
     bleu = self.get_bleu(y.data, predictions)
     return (loss * (1.0 / decode_length), bleu)
 
@@ -125,7 +132,7 @@ def main():
 
   model = Seq2SeqModel(n_vocab, n_embed)
   # TODO: convert to cupy
-#   model.to_gpu()
+  model.to_gpu()
   optimizer = optimizers.SGD()
   optimizer.setup(model)
   converter = partial(convert.concat_examples, padding=PAD_ID)

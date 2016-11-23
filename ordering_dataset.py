@@ -3,9 +3,8 @@ import cupy as cp
 
 def read_lines(dir):
   with open(dir, 'r') as reader:
-    # TODO convert to cupy
-    lines = [np.array(line.strip().split(), dtype=np.int32) for line in reader]
-#     lines = [cp.array(line.strip().split(), dtype=np.int32) for line in reader]
+#   lines = [np.array(line.strip().split(), dtype=np.int32) for line in reader]
+    lines = [cp.array(line.strip().split(), dtype=np.int32) for line in reader]
 #     lines = [line.strip().split() for line in reader]
     return lines
   return None
