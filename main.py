@@ -12,6 +12,9 @@ from chainer.training import extensions
 from iterator import Seq2SeqIterator
 import numpy as np
 from chainer import reporter
+from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import corpus_bleu
+from operator import truth
 
 class LstmEncoder(Chain):
   def __init__(self, in_size, n_out):
@@ -34,16 +37,49 @@ class LstmDecoder(Chain):
       lstm = L.LSTM(in_size, in_size),
       lin = L.Linear(in_size, n_vocab))
 
+  def get_prediction(self, word_id, valid_ids, word_id_batch, predictions):
+    batch_size = valid_ids.shape[0]
+    for word in range(batch_size):
+      valids = valid_ids[word, :]
+      n_words = sum(valids != 0)
+      if word_id >= n_words:
+        continue
+      scores = word_id_batch[word, :]
+      valid_scores = np.take(scores.data, valids[word_id:n_words])
+      max_id = np.argmax(valid_scores)
+      selection = valids[word_id:n_words][max_id]
+      predictions[word, word_id] = selection
+      # swap
+      tmp = valid_ids[word, word_id]
+      valid_ids[word, word_id] = selection
+      valid_ids[word, max_id + word_id] = tmp
+
+  def get_bleu(self, truth, prediction):
+    assert(truth.shape == prediction.shape)
+    batch_size = truth.shape[0]
+    bleu = 0
+    for sentence in range(batch_size):
+      n_words = sum(truth[sentence, :] != 0)
+      reference =  truth[sentence, 0:n_words]
+      hypothesis = prediction[sentence, 0:n_words]
+      bleu += sentence_bleu([[str(x) for x in reference.tolist()]], [str(x) for x in hypothesis.tolist()])
+    return bleu * (1.0 / batch_size)
+    
   def __call__(self, x, y):
     self.lstm.reset_state()
     loss = 0
     decode_length = y.shape[1]
+    # TODO: convert to cupy
+    valid_ids = np.array(y.data)
+    predictions = np.zeros_like(valid_ids)
     for word_id in range(decode_length):
       word_batch = self.lstm(x)
       word_id_batch = self.lin(word_batch)
       truth = y[:, word_id]
       loss += softmax_cross_entropy.softmax_cross_entropy(word_id_batch, truth)
-    return loss * (1.0 / decode_length)
+      self.get_prediction(word_id, valid_ids, word_id_batch, predictions)
+    bleu = self.get_bleu(y.data, predictions)
+    return (loss * (1.0 / decode_length), bleu)
 
 class Seq2SeqModel(Chain):
   def __init__(self, n_vocab, n_embed):
@@ -56,8 +92,9 @@ class Seq2SeqModel(Chain):
     y = self.embed(x)
     z = self.encoder(y)
     n_words = x.shape[1]
-    loss = self.decoder(z, t)
+    loss, bleu = self.decoder(z, t)
     reporter.report({'loss': loss}, self)
+    reporter.report({'bleu': bleu}, self)
     return loss
 
 def main():
@@ -87,12 +124,11 @@ def main():
   n_embed    = 500
 
   model = Seq2SeqModel(n_vocab, n_embed)
-  model.to_gpu()
-#   model_classifier = L.Classifier(model)
+  # TODO: convert to cupy
+#   model.to_gpu()
   optimizer = optimizers.SGD()
   optimizer.setup(model)
   converter = partial(convert.concat_examples, padding=PAD_ID)
-#   updater = training.StandardUpdater(train_iter, optimizer, converter=converter)
   updater = training.StandardUpdater(train_iter, optimizer, converter=converter)
 
 #   updater = training.StandardUpdater(valid_iter, optimizer)
@@ -101,7 +137,7 @@ def main():
 
   trainer.extend(extensions.Evaluator(valid_iter, model, converter=converter))
   trainer.extend(extensions.LogReport())
-  trainer.extend(extensions.PrintReport(['epoch', 'main/loss', 'validation/main/loss']))
+  trainer.extend(extensions.PrintReport(['epoch', 'main/loss', 'main/bleu', 'validation/main/loss', 'validation/main/bleu']))
   trainer.extend(extensions.ProgressBar())
   trainer.run()
   print 'done'
