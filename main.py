@@ -13,7 +13,6 @@ from iterator import Seq2SeqIterator
 import numpy as np
 import cupy as cp
 from chainer import reporter
-from nltk.translate.bleu_score import sentence_bleu
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.bleu_score import SmoothingFunction
 from operator import truth
@@ -34,7 +33,7 @@ class LstmEncoder(Chain):
     return encoding
 
 class LstmDecoder(Chain):
-  def __init__(self, in_size, n_vocab, decode_length):
+  def __init__(self, in_size, n_vocab):
     super(LstmDecoder, self).__init__(
       lstm = L.LSTM(in_size, in_size),
       lin = L.Linear(in_size, n_vocab))
@@ -62,29 +61,42 @@ class LstmDecoder(Chain):
     assert(truth.shape == prediction.shape)
     batch_size = truth.shape[0]
     bleu = 0
+    ref_list = []
+    hyp_list = []
     for sentence in range(batch_size):
       n_words = sum(truth[sentence, :] != 0)
       reference =  truth[sentence, 0:n_words]
       hypothesis = prediction[sentence, 0:n_words]
-      print 'ref: ', reference
-      print 'hyp: ', hypothesis
-      chencherry = SmoothingFunction()
-      bleu += sentence_bleu([[str(x) for x in reference.tolist()]], [str(x) for x in hypothesis.tolist()], smoothing_function=chencherry.method2)
-    return bleu * (1.0 / batch_size)
+      ref_list.append([reference])
+      hyp_list.append(hypothesis)
+    bleu = corpus_bleu(ref_list, hyp_list)
+#       chencherry = SmoothingFunction()
+#       bleu += sentence_bleu([[str(x) for x in reference.tolist()]], [str(x) for x in hypothesis.tolist()], smoothing_function=chencherry.method2)
+#     return bleu * (1.0 / batch_size)
+    return bleu
 
-  def __call__(self, x, y):
-    self.lstm.reset_state()
+  def __call__(self, x, y, embeder, lstm):
+    self.lstm = lstm
+#     self.lstm.reset_state()
     loss = 0
     decode_length = y.shape[1]
     # TODO: convert to cupy
-    valid_ids = cp.asnumpy(y.data)
+    valid_ids = np.array(cp.asnumpy(y.data))
     predictions = np.zeros_like(valid_ids)
+    decoder_input = x
     for word_id in range(decode_length):
-      word_batch = self.lstm(x)
+      # TODO handle test time behavior
+      # TODO This is wrong, we should use truth embedding at train time, and 
+      # and our own predictions at test time, also the decoder should be 
+      # initialized properly
+      word_batch = self.lstm(decoder_input)
       word_id_batch = self.lin(word_batch)
       truth = y[:, word_id]
       loss += softmax_cross_entropy.softmax_cross_entropy(word_id_batch, truth)
       self.get_prediction(word_id, valid_ids, cp.asnumpy(word_id_batch.data), predictions)
+      # Now the decoder input should be the embedding for the true word
+      decoder_input = embeder(truth)
+      
     bleu = self.get_bleu(y.data, predictions)
     return (loss * (1.0 / decode_length), bleu)
 
@@ -93,13 +105,13 @@ class Seq2SeqModel(Chain):
     super(Seq2SeqModel, self).__init__(
       embed   = L.EmbedID(n_vocab, n_embed),
       encoder = LstmEncoder(n_embed, n_embed),
-      decoder = LstmDecoder(n_embed, n_vocab, 10))
+      decoder = LstmDecoder(n_embed, n_vocab))
 
   def __call__(self, x, t):
     y = self.embed(x)
     z = self.encoder(y)
     n_words = x.shape[1]
-    loss, bleu = self.decoder(z, t)
+    loss, bleu = self.decoder(z, t, self.embed, self.encoder.lstm)
     reporter.report({'loss': loss}, self)
     reporter.report({'bleu': bleu}, self)
     return loss
@@ -117,7 +129,9 @@ def main():
 #   test_iter  = MultiprocessIterator(test_data,  batch_size, repeat=False, shuffle=False)
 
   train_iter = SerialIterator(train_data, batch_size, repeat=True,  shuffle=True)
-  valid_iter = SerialIterator(valid_data, batch_size, repeat=False, shuffle= False)
+#   valid_iter = SerialIterator(valid_data, batch_size, repeat=False, shuffle= False)
+  valid_iter = SerialIterator(valid_data, len(valid_data), repeat=False, shuffle= False)
+  valid_train_iter = SerialIterator(valid_data, batch_size, repeat=True, shuffle=True)
   test_iter  = SerialIterator(test_data,  batch_size, repeat=False, shuffle=False)
 
   max_length = 40
@@ -128,15 +142,18 @@ def main():
 #   test_iter  = Seq2SeqIterator(np, test_data,  batch_size, max_length, BOS_ID, EOS_ID, PAD_ID, shuffle=False )
 
   n_vocab    = 15947
-  n_embed    = 500
+#   n_embed    = 500
+  n_embed = 2
 
   model = Seq2SeqModel(n_vocab, n_embed)
   # TODO: convert to cupy
-  model.to_gpu()
+#   model.to_gpu()
   optimizer = optimizers.SGD()
   optimizer.setup(model)
   converter = partial(convert.concat_examples, padding=PAD_ID)
-  updater = training.StandardUpdater(train_iter, optimizer, converter=converter)
+  
+  updater = training.StandardUpdater(valid_train_iter, optimizer, converter=converter)
+#   updater = training.StandardUpdater(train_iter, optimizer, converter=converter)
 
 #   updater = training.StandardUpdater(valid_iter, optimizer)
 
