@@ -69,8 +69,8 @@ class LstmDecoder(Chain):
       hypothesis = prediction[sentence, 0:n_words]
       ref_list.append([reference])
       hyp_list.append(hypothesis)
+    chencherry = SmoothingFunction()
     bleu = corpus_bleu(ref_list, hyp_list)
-#       chencherry = SmoothingFunction()
 #       bleu += sentence_bleu([[str(x) for x in reference.tolist()]], [str(x) for x in hypothesis.tolist()], smoothing_function=chencherry.method2)
 #     return bleu * (1.0 / batch_size)
     return bleu
@@ -86,8 +86,8 @@ class LstmDecoder(Chain):
     decoder_input = x
     for word_id in range(decode_length):
       # TODO handle test time behavior
-      # TODO This is wrong, we should use truth embedding at train time, and 
-      # and our own predictions at test time, also the decoder should be 
+      # TODO This is wrong, we should use truth embedding at train time, and
+      # and our own predictions at test time, also the decoder should be
       # initialized properly
       word_batch = self.lstm(decoder_input)
       word_id_batch = self.lin(word_batch)
@@ -96,7 +96,7 @@ class LstmDecoder(Chain):
       self.get_prediction(word_id, valid_ids, cp.asnumpy(word_id_batch.data), predictions)
       # Now the decoder input should be the embedding for the true word
       decoder_input = embeder(truth)
-      
+
     bleu = self.get_bleu(y.data, predictions)
     return (loss * (1.0 / decode_length), bleu)
 
@@ -143,7 +143,7 @@ def main():
 
   n_vocab    = 15947
 #   n_embed    = 500
-  n_embed = 2
+  n_embed = 200
 
   model = Seq2SeqModel(n_vocab, n_embed)
   # TODO: convert to cupy
@@ -151,7 +151,7 @@ def main():
   optimizer = optimizers.SGD()
   optimizer.setup(model)
   converter = partial(convert.concat_examples, padding=PAD_ID)
-  
+
   updater = training.StandardUpdater(valid_train_iter, optimizer, converter=converter)
 #   updater = training.StandardUpdater(train_iter, optimizer, converter=converter)
 
