@@ -18,6 +18,8 @@ from nltk.translate.bleu_score import SmoothingFunction
 from operator import truth
 from argparse import ArgumentParser
 import h5py
+import chainer.functions as F
+import chainer.links as L
 
 # 
 # Manages encoder/decoder data matrices.
@@ -342,6 +344,531 @@ class Seq2SeqModel(Chain):
     reporter.report({'bleu': bleu}, self)
     return loss
 
+def make_lstm(data, opt, model, use_chars):
+    assert(model == 'enc' or model == 'dec')
+    name = '_' + model
+    # TODO: or 0?!
+    dropout = opt.dropout
+    n = opt.num_layers
+    rnn_size = opt.rnn_size
+    RnnD = [opt.rnn_size, opt.rnn_size]
+    input_size = None
+    if use_chars == 0:
+        input_size = opt.word_vec_size
+    else:
+        input_size = opt.num_kernels
+    offset = 0
+    # there will be 2*n+1 inputs
+    inputs = []
+    inputs.append(F.Identity) # x (batch_size x max_word_l)
+    if model == 'dec':
+        inputs.append(F.Identity) # all context (batch_size x source_l x rnn_size)
+        offset = offset + 1
+        if opt.input_feed == 1:
+            inputs.append(F.Identity) # prev context_attn (batch_size x rnn_size)
+            offset = offset + 1
+    # TODO: num_source_features
+    
+    for l in range(n):
+        inputs.append(F.Identity) # prev_c[l]
+        inputs.append(F.Identity) # prev_h[l]
+     
+    x = None
+    input_size_L = None
+    outputs = []
+    print 'offset: ', offset
+    for l in range(n):
+        nameL = model + '_L' + str(l) + '_'
+        # c,h from previous timesteps
+        prev_c = inputs[l*2+1+offset]
+        prev_h = inputs[l*2+2+offset]
+        # the input to this layer
+        if l == 0:
+            if use_chars == 0:
+                word_vecs = None
+                if model == 'enc':
+                  word_vecs = L.EmbedID(data.source_size, input_size)
+                else:
+                  word_vecs = L.EmbedID(data.target_size, input_size)
+                word_vecs.name = 'word_vecs' + name
+                x = lambda b: word_vecs(inputs[0](b)) # batch_size x word_vec_size
+            # TODO: use_chars
+            # TODO source num features
+            input_size_L = input_size
+            if model == 'dec':
+                if opt.input_feed == 1:
+                    # TODO: Can we use memory pre-allocation with chainer?
+                    # TODO: offset has to be fixed
+                    x = F.Concat(2)((x, inputs[offset])) # batch_size x (word_vec_size + rnn_size)
+                    input_size_L = input_size_L + rnn_size
+            else:
+                input_size_L = input_size_L + data.total_source_features_size
+        else:
+            x = outputs[(l-1)*2]
+            if opt.res_net == 1 and l > 2:
+                x = x + outputs[(l-2)*2]
+            input_size_L = rnn_size
+            if opt.multi_attn == l and model == 'dec':
+                multi_attn = make_decoder_attn(data, opt, 1)
+                multi_attn.name = 'multi_attn' + l
+                x = multi_attn({x, inputs[1]})
+#             if dropout > 0:
+#                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{opt.max_batch_l, input_size_L}})(x)
+        # evaluate the input sums at once for efficiency
+        i2h = L.Linear(input_size_L, 4 * rnn_size)(x)
+        # TODO Why don't we use bias here?
+        h2h = L.Linear(rnn_size, 4 * rnn_size, nobias=True)(prev_h)
+        all_input_sums = i2h + h2h
+           
+        reshaped = F.reshape(all_input_sums, (4, rnn_size))
+        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=2) 
+        # decode the gates
+        in_gate = F.sigmoid(n1)
+        forget_gate = F.sigmoid(n2)
+        out_gate = F.sigmoid(n3)
+        # decode the write inputs
+        in_transform = F.tanh(n4)
+        # perform the LSTM update
+        next_c = (forget_gate * prev_c) + (in_gate * in_transform)
+        # gated cells form the output
+        next_h = out_gate * F.tanh(next_c)
+          
+        outputs.append(next_c)
+        outputs.append(next_h)
+    if model == 'dec':
+        top_h = outputs[-1]
+        decoder_out = None
+        attn_output = None
+        if opt.attn == 1:
+            decoder_attn = make_decoder_attn(data, opt)
+            decoder_attn.name = 'decoder_attn'
+            if opt.guided_alignment == 1:
+                # TODO Implement the attention function
+                decoder_out, attn_output = F.split_axis(decoder_attn({top_h, inputs[2]}), 2)
+            else:
+                decoder_out = decoder_attn({top_h, inputs[2]})
+        else:
+            # TODO: Fix indices
+            decoder_out = F.Concat(2)((top_h, inputs[1]))
+            decoder_out = F.Tanh(F.Linear(opt.rnn_size*2, opt.rnn_size, nobiad=True)(decoder_out))
+        if dropout > 0:
+            # TODO Fix dropout input
+            decoder_out = L.Dropout(dropout, nil, false)
+            outputs.append(decoder_out)
+    # TODO: guided_allignment
+    print 'inputs: ', inputs, ' outputs: ', outputs
+    return None
+    
+def train(train_data, valid_data, opt, layers):
+    timer = None
+    num_params = 0
+    num_prunedparams = 0
+    start_decay = 0
+    params = []
+    grad_params = [] 
+    opt.train_perf = []
+    opt.val_perf = {}
+
+#    for i in range(len(layers)):
+#        # TODO: Implement gpu
+#        p, gp = layers[i]:getParameters()
+#        if len(opt.train_from) == 0:
+#            p:uniform(-opt.param_init, opt.param_init)
+#        num_params = num_params + p:size(1)
+#        params[i] = p
+#        grad_params[i] = gp
+#        layers[i]:apply(function (m) if m.nPruned then num_prunedparams=num_prunedparams+m:nPruned() end end)
+
+    # TODO: opt.pre_word_vecs_enc
+    # TODO: opt.pre_word_vecs_dec
+    # TODO: opt.brnn 
+    print 'Number of parameters: ' + num_params + ' (active: ' + (num_params - num_prunedparams) + ')'
+
+    # TODO: GPU
+#    word_vec_layers[1].weight[1]:zero()
+#    word_vec_layers[2].weight[1]:zero()
+    # TODO: opt.brnn
+
+#  # prototypes for gradients so there is no need to clone
+#  encoder_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
+#  encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
+#  context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
+    # TODO: opt.gpuid2
+
+#  # clone encoder/decoder up to max source/target length
+#  decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
+#  encoder_clones = clone_many_times(encoder, opt.max_sent_l_src)
+    # TODO: opt.brnn
+#  for i = 1, opt.max_sent_l_src do
+#    if encoder_clones[i].apply then
+#      encoder_clones[i]:apply(function(m) m:setReuse() end)
+#    end
+    # TODO: opt.brnn 
+#  end
+#  for i = 1, opt.max_sent_l_targ do
+#    if decoder_clones[i].apply then
+#      decoder_clones[i]:apply(function(m) m:setReuse() end)
+#    end
+#  end
+#
+#  local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
+#  local attn_init = torch.zeros(opt.max_batch_l, opt.max_sent_l)
+    # TODO GPU
+#
+#  -- these are initial states of encoder/decoder for fwd/bwd steps
+#  init_fwd_enc = {}
+#  init_bwd_enc = {}
+#  init_fwd_dec = {}
+#  init_bwd_dec = {}
+#
+#  for L = 1, opt.num_layers do
+#    table.insert(init_fwd_enc, h_init:clone())
+#    table.insert(init_fwd_enc, h_init:clone())
+#    table.insert(init_bwd_enc, h_init:clone())
+#    table.insert(init_bwd_enc, h_init:clone())
+#  end
+# TODO: opt.gpuid2
+#  if opt.input_feed == 1 then
+#    table.insert(init_fwd_dec, h_init:clone())
+#  end
+#  table.insert(init_bwd_dec, h_init:clone())
+#  for L = 1, opt.num_layers do
+#    table.insert(init_fwd_dec, h_init:clone())
+#    table.insert(init_fwd_dec, h_init:clone())
+#    table.insert(init_bwd_dec, h_init:clone())
+#    table.insert(init_bwd_dec, h_init:clone())
+#  end
+#
+#  dec_offset = 3 # offset depends on input feeding
+#  if opt.input_feed == 1 then
+#    dec_offset = dec_offset + 1
+#  end
+#
+#  function reset_state(state, batch_l, t)
+#    if t == nil then
+#      local u = {}
+#      for i = 1, #state do
+#        state[i]:zero()
+#        table.insert(u, state[i][{{1, batch_l}}])
+#      end
+#      return u
+#    else
+#      local u = {[t] = {}}
+#      for i = 1, #state do
+#        state[i]:zero()
+#        table.insert(u[t], state[i][{{1, batch_l}}])
+#      end
+#      return u
+#    end
+#  end
+#
+#  # clean layer before saving to make the model smaller
+#  function clean_layer(layer)
+    # TODO: opt.gpuid
+#    layer.output = torch.DoubleTensor()
+#    layer.gradInput = torch.DoubleTensor()
+#    if layer.modules then
+#      for i, mod in ipairs(layer.modules) do
+#        clean_layer(mod)
+#      end
+#    elseif torch.type(self) == "nn.gModule" then
+#      layer:apply(clean_layer)
+#    end
+#  end
+#
+#  # decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
+#  function decay_lr(epoch)
+#    print(opt.val_perf)
+#    if epoch >= opt.start_decay_at then
+#      start_decay = 1
+#    end
+#
+#    if opt.val_perf[#opt.val_perf] ~= nil and opt.val_perf[#opt.val_perf-1] ~= nil then
+#      local curr_ppl = opt.val_perf[#opt.val_perf]
+#      local prev_ppl = opt.val_perf[#opt.val_perf-1]
+#      if curr_ppl > prev_ppl then
+#        start_decay = 1
+#      end
+#    end
+#    if start_decay == 1 then
+#      opt.learning_rate = opt.learning_rate * opt.lr_decay
+#    end
+#  end
+#
+#  function train_batch(data, epoch)
+#    opt.num_source_features = data.num_source_features
+#
+#    train_nonzeros = 0
+#    train_loss = 0
+#    train_loss_cll = 0
+#    local batch_order = torch.randperm(data.length) -- shuffle mini batch order
+#    local start_time = timer:time().real
+#    num_words_target = 0
+#    num_words_source = 0
+#
+#    for i = 1, data:size() do
+#      zero_table(grad_params, 'zero')
+#      local d
+#      if epoch <= opt.curriculum then
+#        d = data[i]
+#      else
+#        d = data[batch_order[i]]
+#      end
+#      local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
+#      local batch_l, target_l, source_l = d[5], d[6], d[7]
+#      local source_features = d[9]
+#      local alignment = d[10]
+#      local norm_alignment
+    # TODO: opt.guided_alignment
+#
+#      local encoder_grads = encoder_grad_proto[{{1, batch_l}, {1, source_l}}]
+#      local encoder_bwd_grads
+    # TODO: opt.brnn
+    # TODO: opt.gpuid 
+#      local rnn_state_enc = reset_state(init_fwd_enc, batch_l, 0)
+#      local context = context_proto[{{1, batch_l}, {1, source_l}}]
+#      -- forward prop encoder
+#      for t = 1, source_l do
+#        encoder_clones[t]:training()
+#        local encoder_input = {source[t]}
+        # TODO: data.num_source_features
+#        append_table(encoder_input, rnn_state_enc[t-1])
+#        local out = encoder_clones[t]:forward(encoder_input)
+#        rnn_state_enc[t] = out
+#        context[{{},t}]:copy(out[#out])
+#      end
+#
+#      local rnn_state_enc_bwd
+    # TODO opt.brnn
+    # TODO: opt.gpuid opt.gpuid2
+#      # copy encoder last hidden state to decoder initial state
+#      local rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
+#      if opt.init_dec == 1 then
+#        for L = 1, opt.num_layers do
+#          rnn_state_dec[0][L*2-1+opt.input_feed]:copy(rnn_state_enc[source_l][L*2-1])
+#          rnn_state_dec[0][L*2+opt.input_feed]:copy(rnn_state_enc[source_l][L*2])
+#        end
+        # TODO: opt.brnn
+#      end
+#      -- forward prop decoder
+#      local preds = {}
+#      local attn_outputs = {}
+#      local decoder_input
+#      for t = 1, target_l do
+#        decoder_clones[t]:training()
+#        local decoder_input
+#        if opt.attn == 1 then
+#          decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+#        else
+#          decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
+#        end
+#        local out = decoder_clones[t]:forward(decoder_input)
+#        local out_pred_idx = #out
+        # TODO: opt.guided_alignment 
+#        local next_state = {}
+#        table.insert(preds, out[out_pred_idx])
+#        if opt.input_feed == 1 then
+#          table.insert(next_state, out[out_pred_idx])
+#        end
+#        for j = 1, out_pred_idx-1 do
+#          table.insert(next_state, out[j])
+#        end
+#        rnn_state_dec[t] = next_state
+#      end
+#
+#      # backward prop decoder
+#      encoder_grads:zero()
+    # TODO: opt.brnn
+#      local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
+    # TODO: opt.guided_alignment
+#      local loss = 0
+#      local loss_cll = 0
+#      for t = target_l, 1, -1 do
+#        local pred = generator:forward(preds[t])
+#
+#        local input = pred
+#        local output = target_out[t]
+        # TODO: opt.guided_alignment
+#
+#        loss = loss + criterion:forward(input, output)/batch_l
+#
+#        local drnn_state_attn
+#        local dl_dpred
+        # TODO: opt.guided_alignment
+#        dl_dpred = criterion:backward(input, output)
+#
+#        dl_dpred:div(batch_l)
+#        local dl_dtarget = generator:backward(preds[t], dl_dpred)
+#
+#        local rnn_state_dec_pred_idx = #drnn_state_dec
+        # TODO: opt.guided_alignment
+#        drnn_state_dec[rnn_state_dec_pred_idx]:add(dl_dtarget)
+#
+#        local decoder_input
+#        if opt.attn == 1 then
+#          decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
+#        else
+#          decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
+#        end
+#        local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
+#        # accumulate encoder/decoder grads
+#        if opt.attn == 1 then
+#          encoder_grads:add(dlst[2])
+        # TODO: opt.brnn
+#        else
+#          encoder_grads[{{}, source_l}]:add(dlst[2])
+        # TODO: opt.brnn 
+#        end
+#
+#        drnn_state_dec[rnn_state_dec_pred_idx]:zero()
+        # TODO opt.guided_alignment
+#        if opt.input_feed == 1 then
+#          drnn_state_dec[rnn_state_dec_pred_idx]:add(dlst[3])
+#        end
+#        for j = dec_offset, #dlst do
+#          drnn_state_dec[j-dec_offset+1]:copy(dlst[j])
+#        end
+#      end
+#      word_vec_layers[2].gradWeight[1]:zero()
+#      if opt.fix_word_vecs_dec == 1 then
+#        word_vec_layers[2].gradWeight:zero()
+#      end
+#
+#      grad_norm = 0
+#      grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
+#
+#      -- backward prop encoder
+    # TODO: opt.gpuid  opt.gpuid2 
+#      local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
+#      if opt.init_dec == 1 then
+#        for L = 1, opt.num_layers do
+#          drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
+#          drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
+#        end
+#      end
+#
+#      for t = source_l, 1, -1 do
+#        local encoder_input = {source[t]}
+        # TODO: num_source_features
+#        append_table(encoder_input, rnn_state_enc[t-1])
+#        if opt.attn == 1 then
+#          drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
+#        else
+#          if t == source_l then
+#            drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
+#          end
+#        end
+#        local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
+#        for j = 1, #drnn_state_enc do
+#          drnn_state_enc[j]:copy(dlst[j+1+data.num_source_features])
+#        end
+#      end
+#
+        # TODO: opt.brnn 
+#
+#      word_vec_layers[1].gradWeight[1]:zero()
+#      if opt.fix_word_vecs_enc == 1 then
+#        word_vec_layers[1].gradWeight:zero()
+#      end
+#      
+#      grad_norm = grad_norm + grad_params[1]:norm()^2
+    # TODO: opt.brnn
+#      grad_norm = grad_norm^0.5
+#      -- Shrink norm and update params
+#      local param_norm = 0
+#      local shrinkage = opt.max_grad_norm / grad_norm
+#      for j = 1, #grad_params do
+#        if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+#          if j == 1 then
+#            cutorch.setDevice(opt.gpuid)
+#          else
+#            cutorch.setDevice(opt.gpuid2)
+#          end
+#        end
+#        if shrinkage < 1 then
+#          grad_params[j]:mul(shrinkage)
+#        end
+#        if opt.optim == 'adagrad' then
+#          adagrad_step(params[j], grad_params[j], layer_etas[j], optStates[j])
+#        elseif opt.optim == 'adadelta' then
+#          adadelta_step(params[j], grad_params[j], layer_etas[j], optStates[j])
+#        elseif opt.optim == 'adam' then
+#          adam_step(params[j], grad_params[j], layer_etas[j], optStates[j])
+#        else
+#          params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+#        end
+#        param_norm = param_norm + params[j]:norm()^2
+#      end
+#      param_norm = param_norm^0.5
+    # TODO: opt.brnn
+#
+#      # Bookkeeping
+#      num_words_target = num_words_target + batch_l*target_l
+#      num_words_source = num_words_source + batch_l*source_l
+#      train_nonzeros = train_nonzeros + nonzeros
+#      train_loss = train_loss + loss*batch_l
+    # TODO: opt.guided_alignment
+#      local time_taken = timer:time().real - start_time
+#      if i % opt.print_every == 0 then
+#        local stats = string.format('Epoch: %d, Batch: %d/%d, Batch size: %d, LR: %.4f, ',
+#          epoch, i, data:size(), batch_l, opt.learning_rate)
+#        if opt.guided_alignment == 1 then
+#          stats = stats .. string.format('PPL: %.2f, PPL_CLL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
+#            math.exp(train_loss/train_nonzeros), math.exp(train_loss_cll/train_nonzeros), param_norm, grad_norm)
+#        else
+#          stats = stats .. string.format('PPL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
+#            math.exp(train_loss/train_nonzeros), param_norm, grad_norm)
+#        end
+#        stats = stats .. string.format('Training: %d/%d/%d total/source/target tokens/sec',
+#          (num_words_target+num_words_source) / time_taken,
+#          num_words_source / time_taken,
+#          num_words_target / time_taken)
+#        print(stats)
+#      end
+#      if i % 200 == 0 then
+#        collectgarbage()
+#      end
+#    end
+    # TODO: opt.guided_alignment
+#    return train_loss, train_nonzeros
+#  end
+#
+#  local total_loss, total_nonzeros, batch_loss, batch_nonzeros, total_loss_cll, batch_loss_cll
+#  for epoch = opt.start_epoch, opt.epochs do
+#    generator:training()
+    # TODO: opt.num_shards
+    # TODO: opt.guided_alignment
+#    total_loss, total_nonzeros = train_batch(train_data, epoch)
+#    local train_score = math.exp(total_loss/total_nonzeros)
+#    print('Train', train_score)
+#    opt.train_perf[#opt.train_perf + 1] = train_score
+#    local score = eval(valid_data)
+#    opt.val_perf[#opt.val_perf + 1] = score
+#    if opt.optim == 'sgd' then --only decay with SGD
+#      decay_lr(epoch)
+#    end
+    # TODO: opt.guided_alignment 
+#    -- clean and save models
+#    local savefile = string.format('%s_epoch%.2f_%.2f.t7', opt.savefile, epoch, score)
+#    if epoch % opt.save_every == 0 then
+#      print('saving checkpoint to ' .. savefile)
+#      clean_layer(generator)
+#      if opt.brnn == 0 then
+#        torch.save(savefile, {{encoder, decoder, generator}, opt})
+#      else
+#        torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
+#      end
+#    end
+#  end
+#  -- save final model
+#  local savefile = string.format('%s_final.t7', opt.savefile)
+#  clean_layer(generator)
+#  print('saving final model to ' .. savefile)
+    # TODO opt.brnn
+#  torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
+#          encoder_bwd:double()}, opt})
+#end
+
 def main():
     # parse input params
     opt = parse_arguments()
@@ -363,7 +890,6 @@ def main():
         # TODO: Implement shards
         exit(0)
 
- 
     valid_data = Data(opt, opt.val_data_file)
     print 'done!'
 #   print(string.format('Source vocab size: %d, Target vocab size: %d',
@@ -382,80 +908,31 @@ def main():
     # TODO: is there memory preallocation in chainer?
  
     # Build model
-#   if opt.train_from:len() == 0 then
-#     encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
-#     decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
-#     generator, criterion = make_generator(valid_data, opt)
-#     if opt.brnn == 1 then
-#       encoder_bwd = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
-#     end
-#   else
-#     assert(path.exists(opt.train_from), 'checkpoint path invalid')
-#     print('loading ' .. opt.train_from .. '...')
-#     local checkpoint = torch.load(opt.train_from)
-#     local model, model_opt = checkpoint[1], checkpoint[2]
-#     opt.num_layers = model_opt.num_layers
-#     opt.rnn_size = model_opt.rnn_size
-#     opt.input_feed = model_opt.input_feed or 1
-#     opt.attn = model_opt.attn or 1
-#     opt.brnn = model_opt.brnn or 0
-#     encoder = model[1]
-#     decoder = model[2]
-#     generator = model[3]
-#     if model_opt.brnn == 1 then
-#       encoder_bwd = model[4]
-#     end
-#     _, criterion = make_generator(valid_data, opt)
-#   end
+    if len(opt.train_from) == 0:
+        encoder = None
+#        encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
+        decoder = None
+#        decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
+        generator = None
+#        generator, criterion = make_generator(valid_data, opt)
+        # TODO: Implement opt.brnn
+    # TODO: Implement loading a pre-trained model
 
     # TODO: implement opt.guided_alignment
  
-#   layers = {encoder, decoder, generator}
-#   if opt.brnn == 1 then
-#     table.insert(layers, encoder_bwd)
-#   end
-# 
-#   if opt.optim ~= 'sgd' then
-#     layer_etas = {}
-#     optStates = {}
-#     for i = 1, #layers do
-#       layer_etas[i] = opt.learning_rate -- can have layer-specific lr, if desired
-#       optStates[i] = {}
-#     end
-#   end
-# 
-#   if opt.gpuid >= 0 then
-#     for i = 1, #layers do
-#       if opt.gpuid2 >= 0 then
-#         if i == 1 or i == 4 then
-#           cutorch.setDevice(opt.gpuid) --encoder on gpu1
-#         else
-#           cutorch.setDevice(opt.gpuid2) --decoder/generator on gpu2
-#         end
-#       end
-#       layers[i]:cuda()
-#     end
-#     if opt.gpuid2 >= 0 then
-#       cutorch.setDevice(opt.gpuid2) --criterion on gpu2
-#     end
-#     criterion:cuda()
-#   end
-# 
-#   -- these layers will be manipulated during training
-#   word_vec_layers = {}
-#   if opt.use_chars_enc == 1 then
-#     charcnn_layers = {}
-#     charcnn_grad_layers = {}
-#   end
+    layers = [encoder, decoder, generator]
+    # TODO: Implement opt.brnn
+    # TODO: Implement other optimization algorithms
+    # TODO: Implement GPU support
+    
+    # these layers will be manipulated during training
+    word_vec_layers = []
+    # TODO: Implement opt.use_chars_enc
+    
 #   encoder:apply(get_layer)
 #   decoder:apply(get_layer)
-#   if opt.brnn == 1 then
-#     if opt.use_chars_enc == 1 then
-#       charcnn_offset = #charcnn_layers
-#     end
-#     encoder_bwd:apply(get_layer)
-#   end
-#   train(train_data, valid_data)
+    # TODO: implement opt.brnn
+    train(train_data, valid_data, opt, layers)
     
     
     train_data, valid_data, test_data = get_ordering_dataset()
