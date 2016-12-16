@@ -1,26 +1,27 @@
-import time
-from ordering_dataset import get_ordering_dataset
 # from chainer.iterators import MultiprocessIterator
-from chainer.iterators import SerialIterator
+from argparse import ArgumentParser
 from chainer import Chain
-import chainer.links as L
 from chainer import optimizers
+from chainer import reporter
 from chainer import training
 from chainer.dataset import convert
-from functools import partial
 from chainer.functions.loss import softmax_cross_entropy
+from chainer.iterators import SerialIterator
 from chainer.training import extensions
+from functools import partial
 from iterator import Seq2SeqIterator
-import numpy as np
-import cupy as cp
-from chainer import reporter
-from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.bleu_score import SmoothingFunction
+from nltk.translate.bleu_score import corpus_bleu
 from operator import truth
-from argparse import ArgumentParser
-import h5py
+from ordering_dataset import get_ordering_dataset
 import chainer.functions as F
 import chainer.links as L
+import chainer.links as L
+import copy
+import cupy as cp
+import h5py
+import numpy as np
+import time
 
 # 
 # Manages encoder/decoder data matrices.
@@ -85,7 +86,7 @@ class Data():
 
     def __init__(self, opt, data_file):
         f = h5py.File(data_file, 'r')
-        self.source = f['source'][:]
+        self.source = f['source'][:].astype(np.int32)
         self.target = f['target'][:]
         self.target_output = f['target_output'][:]
         self.target_l = f['target_l'][:] # max target length each batch
@@ -322,7 +323,6 @@ class Seq2SeqModel(Chain):
 
 class Encoder(Chain):
     def __init__(self, data, opt, use_chars):
-        assert(model == 'enc')
         self.data = data
         self.opt = opt
         self.use_chars = use_chars
@@ -335,45 +335,37 @@ class Encoder(Chain):
         n = self.opt.num_layers
         rnn_size = self.opt.rnn_size
         RnnD = [self.opt.rnn_size, self.opt.rnn_size]
-        input_size = None
-        if self.use_chars == 0:
-            input_size = self.opt.word_vec_size
-        else:
-            input_size = self.opt.num_kernels
-        offset = 0
+        # TODO: use_chars
+        input_size = self.opt.word_vec_size
         # TODO decoder
         # TODO: num_source_features
          
         x = None
         input_size_L = None
         outputs = []
-        print 'offset: ', offset
         for l in range(n):
             nameL = model + '_L' + str(l) + '_'
             # c,h from previous timesteps
-            prev_c = inputs[l*2+1+offset]
-            prev_h = inputs[l*2+2+offset]
+            prev_c = inputs[l*2+1]
+            prev_h = inputs[l*2+2]
             # the input to this layer
             if l == 0:
-                if self.use_chars == 0:
-                    word_vecs = None
-                    if model == 'enc':
-                      word_vecs = L.EmbedID(self.data.source_size, input_size)
-                    else:
-                      word_vecs = L.EmbedID(self.data.target_size, input_size)
-                    word_vecs.name = 'word_vecs' + name
-                    x = word_vecs(inputs[0]) # batch_size x word_vec_size
+                # TODO: Decoder
+                word_vecs = L.EmbedID(self.data.source_size, input_size)
+                word_vecs.name = 'word_vecs' + name
+                x = word_vecs(inputs[0]) # batch_size x word_vec_size
                 # TODO: use_chars
                 # TODO source num features
                 input_size_L = input_size
                 # TODO: decoder
                 input_size_L = input_size_L + self.data.total_source_features_size
             else:
-                x = outputs[(l-1)*2]
-                if self.opt.res_net == 1 and l > 2:
-                    x = x + outputs[(l-2)*2]
+                # TODO: fix indexing
+                x = outputs[2 * l - 1]
+                # TODO: self.opt.res_net
                 input_size_L = rnn_size
                 # TODO: decoder
+                # TODO: dropout
     #             if dropout > 0:
     #                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{self.opt.max_batch_l, input_size_L}})(x)
             # evaluate the input sums at once for efficiency
@@ -382,8 +374,8 @@ class Encoder(Chain):
             h2h = L.Linear(rnn_size, 4 * rnn_size, nobias=True)(prev_h)
             all_input_sums = i2h + h2h
                
-            reshaped = F.reshape(all_input_sums, (4, rnn_size))
-            n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=2) 
+            reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
+            n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
             # decode the gates
             in_gate = F.sigmoid(n1)
             forget_gate = F.sigmoid(n2)
@@ -391,14 +383,13 @@ class Encoder(Chain):
             # decode the write inputs
             in_transform = F.tanh(n4)
             # perform the LSTM update
-            next_c = (forget_gate * prev_c) + (in_gate * in_transform)
+            next_c = (F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
             # gated cells form the output
-            next_h = out_gate * F.tanh(next_c)
+            next_h = F.squeeze(out_gate) * F.tanh(next_c)
               
             outputs.append(next_c)
             outputs.append(next_h)
         # TODO: guided_allignment
-        print 'inputs: ', inputs, ' outputs: ', outputs
         return outputs
     
 def make_lstm(data, opt, model, use_chars):
@@ -463,7 +454,7 @@ def make_lstm(data, opt, model, use_chars):
             else:
                 input_size_L = input_size_L + data.total_source_features_size
         else:
-            x = outputs[(l-1)*2]
+            x = outputs[2 * l - 1]
             if opt.res_net == 1 and l > 2:
                 x = x + outputs[(l-2)*2]
             input_size_L = rnn_size
@@ -518,7 +509,28 @@ def make_lstm(data, opt, model, use_chars):
     print 'inputs: ', inputs, ' outputs: ', outputs
     return None
     
-def train(train_data, valid_data, opt, layers):
+def clone_many_times(net, T):
+    clones = []
+    for t in range(T):
+        clone = copy.deepcopy(net)
+        clones.append(clone)
+    return clones
+
+def reset_state(state, batch_l, t):
+    if t == None:
+        u = []
+        for i in range(len(state)): 
+            state[i].fill(0)
+            u.append(state[i][0:batch_l])
+        return u
+    else:
+        u = {t: []}
+        for i in range(len(state)):
+            state[i].fill(0)
+            u[t].append(state[i][0:batch_l])
+        return u
+
+def train(train_data, valid_data, opt, layers, encoder, decoder):
     timer = None
     num_params = 0
     num_prunedparams = 0
@@ -555,21 +567,11 @@ def train(train_data, valid_data, opt, layers):
     # TODO: opt.gpuid2
 
     # clone encoder/decoder up to max source/target length
-#  decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
-#  encoder_clones = clone_many_times(encoder, opt.max_sent_l_src)
+    decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
+    encoder_clones = clone_many_times(encoder, opt.max_sent_l_src)
     # TODO: opt.brnn
-#  for i = 1, opt.max_sent_l_src do
-#    if encoder_clones[i].apply then
-#      encoder_clones[i]:apply(function(m) m:setReuse() end)
-#    end
+    # TODO: can we do parameter sharing in Chainer like setReuse?
     # TODO: opt.brnn 
-#  end
-#  for i = 1, opt.max_sent_l_targ do
-#    if decoder_clones[i].apply then
-#      decoder_clones[i]:apply(function(m) m:setReuse() end)
-#    end
-#  end
-
     # TODO xp    
     h_init = np.zeros((opt.max_batch_l, opt.rnn_size), dtype = np.float32)
     attn_init = np.zeros((opt.max_batch_l, opt.max_sent_l))
@@ -601,20 +603,6 @@ def train(train_data, valid_data, opt, layers):
     dec_offset = 3 # offset depends on input feeding
     if opt.input_feed == 1:
         dec_offset = dec_offset + 1
-
-    def reset_state(state, batch_l, t):
-        if t == None:
-            u = []
-            for i in range(len(state)): 
-                state[i].fill(0)
-                u.append(state[i][0:batch_l])
-            return u
-        else:
-            u = {t: []}
-            for i in range(len(state)):
-                state[i].fill(0)
-                u[t].append(state[i][0:batch_l])
-            return u
 
 #  # clean layer before saving to make the model smaller
 #  function clean_layer(layer)
@@ -697,8 +685,7 @@ def train(train_data, valid_data, opt, layers):
                 # TODO: data.num_source_features
                 # TODO: Is the index here correct?
                 encoder_input += rnn_state_enc[t-1]
-                print 'here'
-#                out = encoder_clones[t]:forward(encoder_input)
+                out = encoder_clones[t].forward(encoder_input)
 #                rnn_state_enc[t] = out
 #                context[:,t]:copy(out[len(out)])
             print 'hello train_batch'
@@ -764,7 +751,7 @@ def train(train_data, valid_data, opt, layers):
 #
 #        dl_dpred:div(batch_l)
 #        local dl_dtarget = generator:backward(preds[t], dl_dpred)
-#
+
 #        local rnn_state_dec_pred_idx = #drnn_state_dec
         # TODO: opt.guided_alignment
 #        drnn_state_dec[rnn_state_dec_pred_idx]:add(dl_dtarget)
@@ -891,7 +878,7 @@ def train(train_data, valid_data, opt, layers):
 ############################## end of for
     # TODO: opt.guided_alignment
 #    return train_loss, train_nonzeros
-#
+
     print 'here'
     for epoch in range(opt.start_epoch, opt.epochs): 
         #generator:training()
@@ -989,7 +976,7 @@ def main():
 #   encoder:apply(get_layer)
 #   decoder:apply(get_layer)
     # TODO: implement opt.brnn
-    train(train_data, valid_data, opt, layers)
+    train(train_data, valid_data, opt, layers, encoder, decoder)
     
     
     train_data, valid_data, test_data = get_ordering_dataset()
