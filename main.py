@@ -1,3 +1,4 @@
+import time
 from ordering_dataset import get_ordering_dataset
 # from chainer.iterators import MultiprocessIterator
 from chainer.iterators import SerialIterator
@@ -62,50 +63,25 @@ class Data():
 # local data = torch.class("data")
 # 
 # 
-# function data:size()
-#   return self.length
-# end
-# 
-# function data.__index(self, idx)
-#   if type(idx) == "string" then
-#     return data[idx]
-#   else
-#     local target_input = self.batches[idx][1]
-#     local target_output = self.batches[idx][2]
-#     local nonzeros = self.batches[idx][3]
-#     local source_input = self.batches[idx][4]
-#     local batch_l = self.batches[idx][5]
-#     local target_l = self.batches[idx][6]
-#     local source_l = self.batches[idx][7]
-#     local target_l_all = self.batches[idx][8]
-#     local source_features = self.batches[idx][9]
-#     local alignment = generate_aligns(self.batches[idx][10],
-#                                       self.alignment_cc_colidx,
-#                                       self.alignment_cc_val,
-#                                       source_l,
-#                                       target_l,
-#                                       opt.start_symbol)
-# 
-#     if opt.gpuid >= 0 then --if multi-gpu, source lives in gpuid1, rest on gpuid2
-#       cutorch.setDevice(opt.gpuid)
-#       source_input = source_input:cuda()
-#       source_features = features_on_gpu(source_features)
-#       if opt.gpuid2 >= 0 then
-#         cutorch.setDevice(opt.gpuid2)
-#       end
-#       target_input = target_input:cuda()
-#       target_output = target_output:cuda()
-#       target_l_all = target_l_all:cuda()
-#       if opt.guided_alignment == 1 then
-#         alignment = alignment:cuda()
-#       end
-#     end
-#     return {target_input, target_output, nonzeros, source_input,
-#       batch_l, target_l, source_l, target_l_all, source_features, alignment}
-#   end
-# end
-# 
-# return data
+    def size(self):
+        return self.length
+ 
+    def __getitem__(self, idx):
+        # TODO str
+        target_input = self.batches[idx][0]
+        target_output = self.batches[idx][1]
+        nonzeros = self.batches[idx][2]
+        source_input = self.batches[idx][3]
+        batch_l = self.batches[idx][4]
+        target_l = self.batches[idx][5]
+        source_l = self.batches[idx][6]
+        target_l_all = self.batches[idx][7]
+        source_features = self.batches[idx][8]
+        # TODO generate_aligns
+        alignment = None 
+         # TODO: GPU
+        return [target_input, target_output, nonzeros, source_input,
+            batch_l, target_l, source_l, target_l_all, source_features, alignment]
 
     def __init__(self, opt, data_file):
         f = h5py.File(data_file, 'r')
@@ -216,7 +192,7 @@ def parse_arguments():
     ap.add_argument('--num_highway_layers', type=int, default=2, help='Number of highway layers in the character model')
     # optimization
     ap.add_argument('--epochs', type=int, default=13, help='Number of training epochs')
-    ap.add_argument('--start_epoch', type=int, default=1, help='If loading from a checkpoint, the epoch from which to start')
+    ap.add_argument('--start_epoch', type=int, default=0, help='If loading from a checkpoint, the epoch from which to start')
     ap.add_argument('--param_init', type=float, default=0.1, help='Parameters are initialized over uniform distribution with support (-param_init, param_init)')
     ap.add_argument('--optim', default='sgd', help='Optimization method. Possible options are: sgd (vanilla SGD), adagrad, adadelta, adam')
     ap.add_argument('--learning_rate', type=float, default=1.0, help='Starting learning rate. If adagrad/adadelta/adam is used, then this is the global learning rate. Recommended settings: sgd =1, adagrad = 0.1, adadelta = 1, adam = 0.1')
@@ -344,8 +320,91 @@ class Seq2SeqModel(Chain):
     reporter.report({'bleu': bleu}, self)
     return loss
 
+class Encoder(Chain):
+    def __init__(self, data, opt, use_chars):
+        assert(model == 'enc')
+        self.data = data
+        self.opt = opt
+        self.use_chars = use_chars
+
+    def forward(self, inputs):
+        model = 'enc'
+        name = '_' + model
+        # TODO: or 0?!
+        dropout = self.opt.dropout
+        n = self.opt.num_layers
+        rnn_size = self.opt.rnn_size
+        RnnD = [self.opt.rnn_size, self.opt.rnn_size]
+        input_size = None
+        if self.use_chars == 0:
+            input_size = self.opt.word_vec_size
+        else:
+            input_size = self.opt.num_kernels
+        offset = 0
+        # TODO decoder
+        # TODO: num_source_features
+         
+        x = None
+        input_size_L = None
+        outputs = []
+        print 'offset: ', offset
+        for l in range(n):
+            nameL = model + '_L' + str(l) + '_'
+            # c,h from previous timesteps
+            prev_c = inputs[l*2+1+offset]
+            prev_h = inputs[l*2+2+offset]
+            # the input to this layer
+            if l == 0:
+                if self.use_chars == 0:
+                    word_vecs = None
+                    if model == 'enc':
+                      word_vecs = L.EmbedID(self.data.source_size, input_size)
+                    else:
+                      word_vecs = L.EmbedID(self.data.target_size, input_size)
+                    word_vecs.name = 'word_vecs' + name
+                    x = word_vecs(inputs[0]) # batch_size x word_vec_size
+                # TODO: use_chars
+                # TODO source num features
+                input_size_L = input_size
+                # TODO: decoder
+                input_size_L = input_size_L + self.data.total_source_features_size
+            else:
+                x = outputs[(l-1)*2]
+                if self.opt.res_net == 1 and l > 2:
+                    x = x + outputs[(l-2)*2]
+                input_size_L = rnn_size
+                # TODO: decoder
+    #             if dropout > 0:
+    #                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{self.opt.max_batch_l, input_size_L}})(x)
+            # evaluate the input sums at once for efficiency
+            i2h = L.Linear(input_size_L, 4 * rnn_size)(x)
+            # TODO Why don't we use bias here?
+            h2h = L.Linear(rnn_size, 4 * rnn_size, nobias=True)(prev_h)
+            all_input_sums = i2h + h2h
+               
+            reshaped = F.reshape(all_input_sums, (4, rnn_size))
+            n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=2) 
+            # decode the gates
+            in_gate = F.sigmoid(n1)
+            forget_gate = F.sigmoid(n2)
+            out_gate = F.sigmoid(n3)
+            # decode the write inputs
+            in_transform = F.tanh(n4)
+            # perform the LSTM update
+            next_c = (forget_gate * prev_c) + (in_gate * in_transform)
+            # gated cells form the output
+            next_h = out_gate * F.tanh(next_c)
+              
+            outputs.append(next_c)
+            outputs.append(next_h)
+        # TODO: guided_allignment
+        print 'inputs: ', inputs, ' outputs: ', outputs
+        return outputs
+    
 def make_lstm(data, opt, model, use_chars):
     assert(model == 'enc' or model == 'dec')
+    if model == 'enc':
+        return Encoder(data, opt, use_chars)
     name = '_' + model
     # TODO: or 0?!
     dropout = opt.dropout
@@ -358,7 +417,7 @@ def make_lstm(data, opt, model, use_chars):
     else:
         input_size = opt.num_kernels
     offset = 0
-    # there will be 2*n+1 inputs
+    # there will be 2*n+1 inputs for encoder
     inputs = []
     inputs.append(F.Identity) # x (batch_size x max_word_l)
     if model == 'dec':
@@ -482,20 +541,20 @@ def train(train_data, valid_data, opt, layers):
     # TODO: opt.pre_word_vecs_enc
     # TODO: opt.pre_word_vecs_dec
     # TODO: opt.brnn 
-    print 'Number of parameters: ' + num_params + ' (active: ' + (num_params - num_prunedparams) + ')'
+    print 'Number of parameters: ', num_params, ' (active: ', (num_params - num_prunedparams), ')'
 
     # TODO: GPU
 #    word_vec_layers[1].weight[1]:zero()
 #    word_vec_layers[2].weight[1]:zero()
     # TODO: opt.brnn
 
-#  # prototypes for gradients so there is no need to clone
-#  encoder_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
-#  encoder_bwd_grad_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
-#  context_proto = torch.zeros(opt.max_batch_l, opt.max_sent_l, opt.rnn_size)
+    # prototypes for gradients so there is no need to clone
+    encoder_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
+    encoder_bwd_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
+    context_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
     # TODO: opt.gpuid2
 
-#  # clone encoder/decoder up to max source/target length
+    # clone encoder/decoder up to max source/target length
 #  decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
 #  encoder_clones = clone_many_times(encoder, opt.max_sent_l_src)
     # TODO: opt.brnn
@@ -510,58 +569,53 @@ def train(train_data, valid_data, opt, layers):
 #      decoder_clones[i]:apply(function(m) m:setReuse() end)
 #    end
 #  end
-#
-#  local h_init = torch.zeros(opt.max_batch_l, opt.rnn_size)
-#  local attn_init = torch.zeros(opt.max_batch_l, opt.max_sent_l)
+
+    # TODO xp    
+    h_init = np.zeros((opt.max_batch_l, opt.rnn_size), dtype = np.float32)
+    attn_init = np.zeros((opt.max_batch_l, opt.max_sent_l))
     # TODO GPU
-#
-#  -- these are initial states of encoder/decoder for fwd/bwd steps
-#  init_fwd_enc = {}
-#  init_bwd_enc = {}
-#  init_fwd_dec = {}
-#  init_bwd_dec = {}
-#
-#  for L = 1, opt.num_layers do
-#    table.insert(init_fwd_enc, h_init:clone())
-#    table.insert(init_fwd_enc, h_init:clone())
-#    table.insert(init_bwd_enc, h_init:clone())
-#    table.insert(init_bwd_enc, h_init:clone())
-#  end
-# TODO: opt.gpuid2
-#  if opt.input_feed == 1 then
-#    table.insert(init_fwd_dec, h_init:clone())
-#  end
-#  table.insert(init_bwd_dec, h_init:clone())
-#  for L = 1, opt.num_layers do
-#    table.insert(init_fwd_dec, h_init:clone())
-#    table.insert(init_fwd_dec, h_init:clone())
-#    table.insert(init_bwd_dec, h_init:clone())
-#    table.insert(init_bwd_dec, h_init:clone())
-#  end
-#
-#  dec_offset = 3 # offset depends on input feeding
-#  if opt.input_feed == 1 then
-#    dec_offset = dec_offset + 1
-#  end
-#
-#  function reset_state(state, batch_l, t)
-#    if t == nil then
-#      local u = {}
-#      for i = 1, #state do
-#        state[i]:zero()
-#        table.insert(u, state[i][{{1, batch_l}}])
-#      end
-#      return u
-#    else
-#      local u = {[t] = {}}
-#      for i = 1, #state do
-#        state[i]:zero()
-#        table.insert(u[t], state[i][{{1, batch_l}}])
-#      end
-#      return u
-#    end
-#  end
-#
+
+    # these are initial states of encoder/decoder for fwd/bwd steps
+    init_fwd_enc = []
+    init_bwd_enc = []
+    init_fwd_dec = []
+    init_bwd_dec = []
+
+    for L in range(opt.num_layers):
+        init_fwd_enc.append(h_init.copy())
+        init_fwd_enc.append(h_init.copy())
+        init_bwd_enc.append(h_init.copy())
+        init_bwd_enc.append(h_init.copy())
+
+    # TODO: opt.gpuid2
+    if opt.input_feed == 1:
+        init_fwd_dec.append(h_init.copy())
+    init_bwd_dec.append(h_init.copy())
+    # TODO Move this to a separate function
+    for L in range(opt.num_layers):
+        init_fwd_dec.append(h_init.copy())
+        init_fwd_dec.append(h_init.copy())
+        init_bwd_dec.append(h_init.copy())
+        init_bwd_dec.append(h_init.copy())
+
+    dec_offset = 3 # offset depends on input feeding
+    if opt.input_feed == 1:
+        dec_offset = dec_offset + 1
+
+    def reset_state(state, batch_l, t):
+        if t == None:
+            u = []
+            for i in range(len(state)): 
+                state[i].fill(0)
+                u.append(state[i][0:batch_l])
+            return u
+        else:
+            u = {t: []}
+            for i in range(len(state)):
+                state[i].fill(0)
+                u[t].append(state[i][0:batch_l])
+            return u
+
 #  # clean layer before saving to make the model smaller
 #  function clean_layer(layer)
     # TODO: opt.gpuid
@@ -575,7 +629,7 @@ def train(train_data, valid_data, opt, layers):
 #      layer:apply(clean_layer)
 #    end
 #  end
-#
+
 #  # decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
 #  function decay_lr(epoch)
 #    print(opt.val_perf)
@@ -595,54 +649,65 @@ def train(train_data, valid_data, opt, layers):
 #    end
 #  end
 #
-#  function train_batch(data, epoch)
-#    opt.num_source_features = data.num_source_features
-#
-#    train_nonzeros = 0
-#    train_loss = 0
-#    train_loss_cll = 0
-#    local batch_order = torch.randperm(data.length) -- shuffle mini batch order
-#    local start_time = timer:time().real
-#    num_words_target = 0
-#    num_words_source = 0
-#
-#    for i = 1, data:size() do
-#      zero_table(grad_params, 'zero')
-#      local d
-#      if epoch <= opt.curriculum then
-#        d = data[i]
-#      else
-#        d = data[batch_order[i]]
-#      end
-#      local target, target_out, nonzeros, source = d[1], d[2], d[3], d[4]
-#      local batch_l, target_l, source_l = d[5], d[6], d[7]
-#      local source_features = d[9]
-#      local alignment = d[10]
-#      local norm_alignment
-    # TODO: opt.guided_alignment
-#
-#      local encoder_grads = encoder_grad_proto[{{1, batch_l}, {1, source_l}}]
-#      local encoder_bwd_grads
-    # TODO: opt.brnn
-    # TODO: opt.gpuid 
-#      local rnn_state_enc = reset_state(init_fwd_enc, batch_l, 0)
-#      local context = context_proto[{{1, batch_l}, {1, source_l}}]
-#      -- forward prop encoder
-#      for t = 1, source_l do
-#        encoder_clones[t]:training()
-#        local encoder_input = {source[t]}
-        # TODO: data.num_source_features
-#        append_table(encoder_input, rnn_state_enc[t-1])
-#        local out = encoder_clones[t]:forward(encoder_input)
-#        rnn_state_enc[t] = out
-#        context[{{},t}]:copy(out[#out])
-#      end
-#
-#      local rnn_state_enc_bwd
-    # TODO opt.brnn
-    # TODO: opt.gpuid opt.gpuid2
-#      # copy encoder last hidden state to decoder initial state
-#      local rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
+    def train_batch(data, epoch):
+        opt.num_source_features = data.num_source_features
+
+        train_nonzeros = 0
+        train_loss = 0
+        train_loss_cll = 0
+        batch_order = np.random.permutation(data.length) # shuffle mini batch order
+        start_time = time.time()
+        num_words_target = 0
+        num_words_source = 0
+
+        for i in range(data.length):
+            print i 
+            # TODO zero grads?
+            # zero_table(grad_params, 'zero')
+            # TODO: opt.curriculum
+            d = data[batch_order[i]]
+            print d
+            target, target_out, nonzeros, source = d[0], d[1], d[2], d[3]
+            print 'target: ', target
+            print 'target_out: ', target_out
+            print 'nonzeros: ', nonzeros
+            print 'source: ', source
+            batch_l, target_l, source_l = d[4], d[5], d[6]
+            print 'batch_l: ', batch_l
+            print 'target_l: ', target_l
+            print 'source_l: ', source_l
+            source_features = d[8]
+            print 'source_features: ', source_features
+            alignment = d[9]
+            print 'alignment: ', alignment
+            norm_alignment = None
+            # TODO: opt.guided_alignment
+            encoder_grads = encoder_grad_proto[0:batch_l, 0:source_l]
+            encoder_bwd_grads = None
+            # TODO: opt.brnn
+            # TODO: opt.gpuid 
+            rnn_state_enc = reset_state(init_fwd_enc, batch_l, -1)
+            context = context_proto[0:batch_l, 0:source_l]
+            # forward prop encoder
+            for t in range(source_l):
+                print 'source_l'
+                # TODO: set traiining to True, this is important for dropout
+#                encoder_clones[t]:training()
+                encoder_input = [source[t]]
+                # TODO: data.num_source_features
+                # TODO: Is the index here correct?
+                encoder_input += rnn_state_enc[t-1]
+                print 'here'
+#                out = encoder_clones[t]:forward(encoder_input)
+#                rnn_state_enc[t] = out
+#                context[:,t]:copy(out[len(out)])
+            print 'hello train_batch'
+
+            rnn_state_enc_bwd = None
+            # TODO opt.brnn
+            # TODO: opt.gpuid opt.gpuid2
+            # copy encoder last hidden state to decoder initial state
+            rnn_state_dec = reset_state(init_fwd_dec, batch_l, 0)
 #      if opt.init_dec == 1 then
 #        for L = 1, opt.num_layers do
 #          rnn_state_dec[0][L*2-1+opt.input_feed]:copy(rnn_state_enc[source_l][L*2-1])
@@ -650,7 +715,7 @@ def train(train_data, valid_data, opt, layers):
 #        end
         # TODO: opt.brnn
 #      end
-#      -- forward prop decoder
+#      # forward prop decoder
 #      local preds = {}
 #      local attn_outputs = {}
 #      local decoder_input
@@ -675,7 +740,7 @@ def train(train_data, valid_data, opt, layers):
 #        end
 #        rnn_state_dec[t] = next_state
 #      end
-#
+
 #      # backward prop decoder
 #      encoder_grads:zero()
     # TODO: opt.brnn
@@ -719,7 +784,7 @@ def train(train_data, valid_data, opt, layers):
 #          encoder_grads[{{}, source_l}]:add(dlst[2])
         # TODO: opt.brnn 
 #        end
-#
+
 #        drnn_state_dec[rnn_state_dec_pred_idx]:zero()
         # TODO opt.guided_alignment
 #        if opt.input_feed == 1 then
@@ -730,14 +795,11 @@ def train(train_data, valid_data, opt, layers):
 #        end
 #      end
 #      word_vec_layers[2].gradWeight[1]:zero()
-#      if opt.fix_word_vecs_dec == 1 then
-#        word_vec_layers[2].gradWeight:zero()
-#      end
-#
+    # TODO: opt.fix_word_vecs_dec 
 #      grad_norm = 0
 #      grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
 #
-#      -- backward prop encoder
+#      # backward prop encoder
     # TODO: opt.gpuid  opt.gpuid2 
 #      local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
 #      if opt.init_dec == 1 then
@@ -767,9 +829,7 @@ def train(train_data, valid_data, opt, layers):
         # TODO: opt.brnn 
 #
 #      word_vec_layers[1].gradWeight[1]:zero()
-#      if opt.fix_word_vecs_enc == 1 then
-#        word_vec_layers[1].gradWeight:zero()
-#      end
+    # TODO: opt.fix_word_vecs_enc
 #      
 #      grad_norm = grad_norm + grad_params[1]:norm()^2
     # TODO: opt.brnn
@@ -801,7 +861,6 @@ def train(train_data, valid_data, opt, layers):
 #      end
 #      param_norm = param_norm^0.5
     # TODO: opt.brnn
-#
 #      # Bookkeeping
 #      num_words_target = num_words_target + batch_l*target_l
 #      num_words_source = num_words_source + batch_l*source_l
@@ -829,45 +888,44 @@ def train(train_data, valid_data, opt, layers):
 #        collectgarbage()
 #      end
 #    end
+############################## end of for
     # TODO: opt.guided_alignment
 #    return train_loss, train_nonzeros
-#  end
 #
-#  local total_loss, total_nonzeros, batch_loss, batch_nonzeros, total_loss_cll, batch_loss_cll
-#  for epoch = opt.start_epoch, opt.epochs do
-#    generator:training()
-    # TODO: opt.num_shards
-    # TODO: opt.guided_alignment
-#    total_loss, total_nonzeros = train_batch(train_data, epoch)
-#    local train_score = math.exp(total_loss/total_nonzeros)
-#    print('Train', train_score)
-#    opt.train_perf[#opt.train_perf + 1] = train_score
-#    local score = eval(valid_data)
-#    opt.val_perf[#opt.val_perf + 1] = score
-#    if opt.optim == 'sgd' then --only decay with SGD
-#      decay_lr(epoch)
-#    end
-    # TODO: opt.guided_alignment 
-#    -- clean and save models
-#    local savefile = string.format('%s_epoch%.2f_%.2f.t7', opt.savefile, epoch, score)
-#    if epoch % opt.save_every == 0 then
-#      print('saving checkpoint to ' .. savefile)
-#      clean_layer(generator)
-#      if opt.brnn == 0 then
-#        torch.save(savefile, {{encoder, decoder, generator}, opt})
-#      else
-#        torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
-#      end
-#    end
-#  end
-#  -- save final model
+    print 'here'
+    for epoch in range(opt.start_epoch, opt.epochs): 
+        #generator:training()
+        # TODO: opt.num_shards
+        # TODO: opt.guided_alignment
+        total_loss, total_nonzeros = train_batch(train_data, epoch)
+#        local train_score = math.exp(total_loss/total_nonzeros)
+#        print('Train', train_score)
+#        opt.train_perf[#opt.train_perf + 1] = train_score
+#        local score = eval(valid_data)
+#        opt.val_perf[#opt.val_perf + 1] = score
+#        if opt.optim == 'sgd' then --only decay with SGD
+#          decay_lr(epoch)
+#        end
+#       # TODO: opt.guided_alignment 
+#        -- clean and save models
+#        local savefile = string.format('%s_epoch%.2f_%.2f.t7', opt.savefile, epoch, score)
+#        if epoch % opt.save_every == 0 then
+#          print('saving checkpoint to ' .. savefile)
+#          clean_layer(generator)
+#          if opt.brnn == 0 then
+#            torch.save(savefile, {{encoder, decoder, generator}, opt})
+#          else
+#            torch.save(savefile, {{encoder, decoder, generator, encoder_bwd}, opt})
+#          end
+#        end
+
+    # save final model
 #  local savefile = string.format('%s_final.t7', opt.savefile)
 #  clean_layer(generator)
 #  print('saving final model to ' .. savefile)
     # TODO opt.brnn
 #  torch.save(savefile, {{encoder:double(), decoder:double(), generator:double(),
 #          encoder_bwd:double()}, opt})
-#end
 
 def main():
     # parse input params
@@ -909,8 +967,7 @@ def main():
  
     # Build model
     if len(opt.train_from) == 0:
-        encoder = None
-#        encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
+        encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
         decoder = None
 #        decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
         generator = None
