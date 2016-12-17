@@ -14,6 +14,7 @@ from nltk.translate.bleu_score import SmoothingFunction
 from nltk.translate.bleu_score import corpus_bleu
 from operator import truth
 from ordering_dataset import get_ordering_dataset
+import chainer.computational_graph as g
 import chainer.functions as F
 import chainer.links as L
 import chainer.links as L
@@ -22,6 +23,9 @@ import cupy as cp
 import h5py
 import numpy as np
 import time
+import os
+from chainer.initializers import Uniform
+from chainer import Variable
 
 # 
 # Manages encoder/decoder data matrices.
@@ -88,7 +92,7 @@ class Data():
         f = h5py.File(data_file, 'r')
         self.source = f['source'][:].astype(np.int32)
         self.target = f['target'][:].astype(np.int32)
-        self.target_output = f['target_output'][:]
+        self.target_output = f['target_output'][:].astype(np.int32)
         self.target_l = f['target_l'][:] # max target length each batch
         self.target_l_all = f['target_l_all'][:]
         self.target_l_all = self.target_l_all - 1
@@ -201,7 +205,7 @@ def parse_arguments():
     ap.add_argument('--dropout', type=float, default=0.3, help='Dropout probability. Dropout is applied between vertical LSTM stacks.')
     ap.add_argument('--lr_decay', type=float, default=0.5, help='Decay learning rate by this much if (i) perplexity does not decrease on the validation set or (ii) epoch has gone past the start_decay_at_limit')
     ap.add_argument('--start_decay_at', type=int, default=9, help='Start decay after this epoch')
-    ap.add_argument('--curriculum', type=int, default=0, help='For this many epochs, order the minibatches based on source sequence length. Sometimes setting this to 1 will increase convergence speed.')
+    ap.add_argument('--curriculum', type=int, default=-1, help='For this many epochs, order the minibatches based on source sequence length. Sometimes setting this to 1 will increase convergence speed.')
     ap.add_argument('--feature_embeddings_dim_exponent', type=float, default=0.7, help='If the feature takes N values, then the embbeding dimension will be set to N^exponent')
     ap.add_argument('--pre_word_vecs_enc', default='', help='If a valid path is specified, then this will load pretrained word embeddings (hdf5 file) on the encoder side. See README for specific formatting instructions.')
     ap.add_argument('--pre_word_vecs_dec', default='', help='If a valid path is specified, then this will load pretrained word embeddings (hdf5 file) on the decoder side. See README for specific formatting instructions.')
@@ -326,6 +330,14 @@ class Encoder(Chain):
         self.data = data
         self.opt = opt
         self.use_chars = use_chars
+        input_size = opt.word_vec_size
+        rnn_size = opt.rnn_size
+        super(Encoder, self).__init__(embd = L.EmbedID(self.data.source_size, input_size),
+             i2h1 = L.Linear(input_size, 4 * rnn_size), 
+             h2h1 = L.Linear(rnn_size, 4 * rnn_size, nobias=True),
+             i2h2 = L.Linear(rnn_size, 4 * rnn_size), 
+             h2h2 = L.Linear(rnn_size, 4 * rnn_size, nobias=True)             
+        )
 
     def forward(self, inputs):
         model = 'enc'
@@ -337,58 +349,84 @@ class Encoder(Chain):
         RnnD = [self.opt.rnn_size, self.opt.rnn_size]
         # TODO: use_chars
         input_size = self.opt.word_vec_size
-        # TODO decoder
         # TODO: num_source_features
          
         x = None
         input_size_L = None
         outputs = []
-        for l in range(n):
-            nameL = model + '_L' + str(l) + '_'
-            # c,h from previous timesteps
-            prev_c = inputs[l*2+1]
-            prev_h = inputs[l*2+2]
-            # the input to this layer
-            if l == 0:
-                # TODO: Decoder
-                word_vecs = L.EmbedID(self.data.source_size, input_size)
-                word_vecs.name = 'word_vecs' + name
-                x = word_vecs(inputs[0]) # batch_size x word_vec_size
-                # TODO: use_chars
-                # TODO source num features
-                input_size_L = input_size
-                # TODO: decoder
-                input_size_L = input_size_L + self.data.total_source_features_size
-            else:
-                # TODO: fix indexing
-                x = outputs[2 * l - 1]
-                # TODO: self.opt.res_net
-                input_size_L = rnn_size
-                # TODO: decoder
-                # TODO: dropout
-    #             if dropout > 0:
-    #                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{self.opt.max_batch_l, input_size_L}})(x)
-            # evaluate the input sums at once for efficiency
-            i2h = L.Linear(input_size_L, 4 * rnn_size)(x)
-            # TODO Why don't we use bias here?
-            h2h = L.Linear(rnn_size, 4 * rnn_size, nobias=True)(prev_h)
-            all_input_sums = i2h + h2h
-               
-            reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
-            n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
-            # decode the gates
-            in_gate = F.sigmoid(n1)
-            forget_gate = F.sigmoid(n2)
-            out_gate = F.sigmoid(n3)
-            # decode the write inputs
-            in_transform = F.tanh(n4)
-            # perform the LSTM update
-            next_c = (F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
-            # gated cells form the output
-            next_h = F.squeeze(out_gate) * F.tanh(next_c)
-              
-            outputs.append(next_c)
-            outputs.append(next_h)
+
+        nameL = model + '_L' + str(0) + '_'
+        # c,h from previous timesteps
+        prev_c = inputs[1]
+        prev_h = inputs[2]
+        # the input to this layer
+        x = self.embd(inputs[0]) # batch_size x word_vec_size
+        # TODO: use_chars
+        # TODO source num features
+        input_size_L = input_size
+        input_size_L = input_size_L + self.data.total_source_features_size
+        # evaluate the input sums at once for efficiency
+        i2h = self.i2h1(x)
+        # TODO Why don't we use bias here?
+        h2h = self.h2h1(prev_h)
+        all_input_sums = i2h + h2h
+           
+        reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
+#        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
+        n1 = reshaped[:, 0, :]
+        n2 = reshaped[:, 1, :] 
+        n3 = reshaped[:, 2, :] 
+        n4 = reshaped[:, 3, :] 
+        # decode the gates
+        in_gate = F.sigmoid(n1)
+        forget_gate = F.sigmoid(n2)
+        out_gate = F.sigmoid(n3)
+        # decode the write inputs
+        in_transform = F.tanh(n4)
+        # perform the LSTM update
+        next_c = (forget_gate * prev_c) + (in_gate * in_transform)
+        # gated cells form the output
+        next_h = out_gate * F.tanh(next_c)
+          
+        outputs.append(next_c)
+        outputs.append(next_h)
+        # Second LSTM
+        nameL = model + '_L' + str(1) + '_'
+        # c,h from previous timesteps
+        prev_c = inputs[3]
+        prev_h = inputs[4]
+        # the input to this layer
+        # TODO: fix indexing
+        x = outputs[1]
+        # TODO: self.opt.res_net
+        input_size_L = rnn_size
+        # TODO: dropout
+#             if dropout > 0:
+#                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{self.opt.max_batch_l, input_size_L}})(x)
+        # evaluate the input sums at once for efficiency
+        i2h = self.i2h2(x)
+        # TODO Why don't we use bias here?
+        h2h = self.h2h2(prev_h)
+        all_input_sums = i2h + h2h
+           
+        reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
+        n1 = reshaped[:, 0, :] 
+        n2 = reshaped[:, 1, :] 
+        n3 = reshaped[:, 2, :] 
+        n4 = reshaped[:, 3, :] 
+        # decode the gates
+        in_gate = F.sigmoid(n1)
+        forget_gate = F.sigmoid(n2)
+        out_gate = F.sigmoid(n3)
+        # decode the write inputs
+        in_transform = F.tanh(n4)
+        # perform the LSTM update
+        next_c = (forget_gate * prev_c) + (in_gate * in_transform)
+        # gated cells form the output
+        next_h = out_gate * F.tanh(next_c)
+          
+        outputs.append(next_c)
+        outputs.append(next_h)
         # TODO: guided_allignment
         return outputs
     
@@ -397,6 +435,15 @@ class Decoder(Chain):
         self.data = data
         self.opt = opt
         self.use_chars = use_chars
+        input_size = opt.word_vec_size
+        rnn_size = opt.rnn_size
+        # TODO: Fix this
+        super(Decoder, self).__init__(embd=L.EmbedID(self.data.target_size, input_size),
+            i2h1 = L.Linear(input_size+rnn_size, 4 * rnn_size),
+            h2h1 = L.Linear(rnn_size, 4 * rnn_size, nobias=True),
+            i2h2 = L.Linear(rnn_size, 4 * rnn_size),
+            h2h2 = L.Linear(rnn_size, 4 * rnn_size, nobias=True),
+            dec_out = L.Linear(self.opt.rnn_size*2, self.opt.rnn_size, nobias=True))
 
     def forward(self, inputs):
         model = 'dec'
@@ -416,53 +463,78 @@ class Decoder(Chain):
         x = None
         input_size_L = None
         outputs = []
-        print 'offset: ', offset
-        for l in range(n):
-            nameL = model + '_L' + str(l) + '_'
-            # c,h from previous timesteps
-            prev_c = inputs[l*2+1+offset]
-            prev_h = inputs[l*2+2+offset]
-            # the input to this layer
-            if l == 0:
-                word_vecs = L.EmbedID(self.data.target_size, input_size)
-                word_vecs.name = 'word_vecs' + name
-                x = word_vecs(inputs[0]) # batch_size x word_vec_size
-                # TODO: use_chars
-                # TODO source num features
-                input_size_L = input_size
-                if self.opt.input_feed == 1:
-                    # TODO: Can we use memory pre-allocation with chainer?
-                    x = F.concat((x, inputs[offset]), axis=1) # batch_size x (word_vec_size + rnn_size)
-                    input_size_L = input_size_L + rnn_size
-            else:
-                x = outputs[2 * l - 1]
-                # TODOi: opt.res_net 
-                input_size_L = rnn_size
-                # TODO: opt.multi_attn
-                # TODO: dropout
-    #             if dropout > 0:
-    #                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{opt.max_batch_l, input_size_L}})(x)
-            # evaluate the input sums at once for efficiency
-            i2h = L.Linear(input_size_L, 4 * rnn_size)(x)
-            # TODO Why don't we use bias here?
-            h2h = L.Linear(rnn_size, 4 * rnn_size, nobias=True)(prev_h)
-            all_input_sums = i2h + h2h
-               
-            reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
-            n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
-            # decode the gates
-            in_gate = F.sigmoid(n1)
-            forget_gate = F.sigmoid(n2)
-            out_gate = F.sigmoid(n3)
-            # decode the write inputs
-            in_transform = F.tanh(n4)
-            # perform the LSTM update
-            next_c = F.squeeze(F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
-            # gated cells form the output
-            next_h = F.squeeze(out_gate) * F.tanh(next_c)
-              
-            outputs.append(next_c)
-            outputs.append(next_h)
+        # First LSTM
+        nameL = model + '_L' + str(0) + '_'
+        # c,h from previous timesteps
+        prev_c = inputs[1+offset]
+        prev_h = inputs[2+offset]
+        # the input to this layer
+        word_vecs = self.embd 
+        word_vecs.name = 'word_vecs' + name
+        x = word_vecs(inputs[0]) # batch_size x word_vec_size
+        # TODO: use_chars
+        # TODO source num features
+        input_size_L = input_size
+        if self.opt.input_feed == 1:
+            # TODO: Can we use memory pre-allocation with chainer?
+            x = F.concat((x, inputs[offset]), axis=1) # batch_size x (word_vec_size + rnn_size)
+            input_size_L = input_size_L + rnn_size
+        # evaluate the input sums at once for efficiency
+        i2h = self.i2h1(x)
+        # TODO Why don't we use bias here?
+        h2h = self.h2h1(prev_h)
+        all_input_sums = i2h + h2h
+           
+        reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
+        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
+        # decode the gates
+        in_gate = F.sigmoid(n1)
+        forget_gate = F.sigmoid(n2)
+        out_gate = F.sigmoid(n3)
+        # decode the write inputs
+        in_transform = F.tanh(n4)
+        # perform the LSTM update
+        next_c = F.squeeze(F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
+        # gated cells form the output
+        next_h = F.squeeze(out_gate) * F.tanh(next_c)
+          
+        outputs.append(next_c)
+        outputs.append(next_h)
+        # Second LSTM
+        nameL = model + '_L' + str(1) + '_'
+        # c,h from previous timesteps
+        prev_c = inputs[1*2+1+offset]
+        prev_h = inputs[1*2+2+offset]
+        # the input to this layer
+        x = outputs[2 * 1 - 1]
+        # TODOi: opt.res_net 
+        input_size_L = rnn_size
+        # TODO: opt.multi_attn
+        # TODO: dropout
+#             if dropout > 0:
+#                 x = nn.Dropout(dropout, nil, false):usePrealloc(nameL.."dropout", {{opt.max_batch_l, input_size_L}})(x)
+        # evaluate the input sums at once for efficiency
+        i2h = self.i2h2(x)
+        # TODO Why don't we use bias here?
+        h2h = self.h2h2(prev_h)
+        all_input_sums = i2h + h2h
+           
+        reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
+        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
+        # decode the gates
+        in_gate = F.sigmoid(n1)
+        forget_gate = F.sigmoid(n2)
+        out_gate = F.sigmoid(n3)
+        # decode the write inputs
+        in_transform = F.tanh(n4)
+        # perform the LSTM update
+        next_c = F.squeeze(F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
+        # gated cells form the output
+        next_h = F.squeeze(out_gate) * F.tanh(next_c)
+          
+        outputs.append(next_c)
+        outputs.append(next_h)
+
         top_h = outputs[-1]
         decoder_out = None
         attn_output = None
@@ -476,14 +548,33 @@ class Decoder(Chain):
                 decoder_out = decoder_attn({top_h, inputs[2]})
         else:
             # TODO: Fix indices
-            decoder_out = F.concat((top_h, inputs[1].astype(np.float32)))
-            decoder_out = F.tanh(L.Linear(self.opt.rnn_size*2, self.opt.rnn_size, nobias=True)(decoder_out))
+            decoder_out = F.concat((top_h, inputs[1]))
+#            decoder_out = F.concat((top_h, inputs[1].astype(np.float32)))
+            decoder_out = F.tanh(self.dec_out(decoder_out))
         if dropout > 0:
             # TODO: Fix dropout input
             decoder_out = L.Dropout(dropout, nil, false)
         outputs.append(decoder_out)
         # TODO: guided_allignment
         return outputs
+
+class Criterion(Chain):
+    
+    def forward(self, input, output):
+        # w = np.ones(self.data.target_size)
+        # w[0] = 0
+        return F.softmax_cross_entropy(input, output, normalize=False)
+
+class Generator(Chain):
+    
+    def __init__(self, data, opt):
+       self.data = data
+       super(Generator, self).__init__(lin=L.Linear(opt.rnn_size, data.target_size))
+        
+    def forward(self, x):
+        output = self.lin(x)
+        output = F.log_softmax(output)
+        return output
 
 def clone_many_times(net, T):
     clones = []
@@ -492,7 +583,7 @@ def clone_many_times(net, T):
         clones.append(clone)
     return clones
 
-def reset_state(state, batch_l, t):
+def reset_state(state, batch_l, t=None):
     if t == None:
         u = []
         for i in range(len(state)): 
@@ -506,30 +597,33 @@ def reset_state(state, batch_l, t):
             u[t].append(state[i][0:batch_l])
         return u
 
-def train(train_data, valid_data, opt, layers, encoder, decoder):
+def train(train_data, valid_data, opt, layers, encoder, decoder, generator, criterion):
     timer = None
     num_params = 0
-    num_prunedparams = 0
     start_decay = 0
     params = []
     grad_params = [] 
     opt.train_perf = []
     opt.val_perf = {}
 
-#    for i in range(len(layers)):
-#        # TODO: Implement gpu
+    for i in range(len(layers)):
+        # TODO: Implement gpu
+        print layers[i]
+        params_lst = list(layers[i].params())
+        params.append(params_lst)
 #        p, gp = layers[i]:getParameters()
-#        if len(opt.train_from) == 0:
-#            p:uniform(-opt.param_init, opt.param_init)
-#        num_params = num_params + p:size(1)
-#        params[i] = p
+        # TOOD: move this to the link initializer
+        if len(opt.train_from) == 0:
+            for p in params_lst:
+                num_params += p.size 
+                Uniform(scale=opt.param_init)(p.data)
 #        grad_params[i] = gp
-#        layers[i]:apply(function (m) if m.nPruned then num_prunedparams=num_prunedparams+m:nPruned() end end)
-
+        # TODO: can we do linear pruning in Chainer?
+        
     # TODO: opt.pre_word_vecs_enc
     # TODO: opt.pre_word_vecs_dec
     # TODO: opt.brnn 
-    print 'Number of parameters: ', num_params, ' (active: ', (num_params - num_prunedparams), ')'
+    print 'Number of parameters: ', num_params, ' (active: ', num_params, ')'
 
     # TODO: GPU
 #    word_vec_layers[1].weight[1]:zero()
@@ -539,7 +633,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
     # prototypes for gradients so there is no need to clone
     encoder_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
     encoder_bwd_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
-    context_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
+    context_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size)).astype(np.float32)
     # TODO: opt.gpuid2
 
     # clone encoder/decoder up to max source/target length
@@ -628,8 +722,10 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
             print i 
             # TODO zero grads?
             # zero_table(grad_params, 'zero')
-            # TODO: opt.curriculum
-            d = data[batch_order[i]]
+            if epoch <= opt.curriculum:
+                d = data[i]
+            else:
+                d = data[batch_order[i]]
             print d
             target, target_out, nonzeros, source = d[0], d[1], d[2], d[3]
             print 'target: ', target
@@ -655,13 +751,18 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
             # forward prop encoder
             for t in range(source_l):
                 print 'source_l'
-                # TODO: set traiining to True, this is important for dropout
+                # TODO: set training to True, this is important for dropout
 #                encoder_clones[t]:training()
                 encoder_input = [source[t]]
                 # TODO: data.num_source_features
                 # TODO: Is the index here correct?
                 encoder_input += rnn_state_enc[t-1]
                 out = encoder_clones[t].forward(encoder_input)
+#                c = g.build_computational_graph(out)
+#                with open('graph.dot', 'w') as writer:
+#                    writer.write(c.dump())
+#                os.system('/usr/local/bin/dot -Tpdf graph.dot > graph.pdf')
+#                os.system('open graph.pdf')
                 rnn_state_enc[t] = out
                 # TODO: why do we need copy here?
                 context[:,t] = out[len(out) - 1].data
@@ -681,6 +782,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
             preds = []
             attn_outputs = []
             decoder_input = None
+            decoder_inputs = []
             for t in range(target_l):
                 print 'target_l'
                 # TODO: set training parameter for dropout
@@ -688,7 +790,10 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
                 if opt.attn == 1:
                     decoder_input = [target[t], context] + rnn_state_dec[t-1]
                 else:
-                    decoder_input = [target[t], context[:, source_l - 1]] + rnn_state_dec[t-1]
+                    decoder_input = [Variable(target[t]), Variable(context[:, source_l - 1])] + rnn_state_dec[t-1]
+                    if t == 0:
+                        decoder_input[2] = Variable(decoder_input[2])
+                decoder_inputs.append(decoder_input)
                 out = decoder_clones[t].forward(decoder_input)
                 out_pred_idx = len(out)
                 # TODO: opt.guided_alignment 
@@ -701,59 +806,52 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
                 rnn_state_dec[t] = next_state
 
             # backward prop decoder
-            print 'hello backprop'
-#      encoder_grads:zero()
+            encoder_grads.fill(0)
             # TODO: opt.brnn
-#      local drnn_state_dec = reset_state(init_bwd_dec, batch_l)
+            drnn_state_dec = reset_state(init_bwd_dec, batch_l)
             # TODO: opt.guided_alignment
-#      local loss = 0
-#      local loss_cll = 0
-#      for t = target_l, 1, -1 do
-#        local pred = generator:forward(preds[t])
-#
-#        local input = pred
-#        local output = target_out[t]
-        # TODO: opt.guided_alignment
-#
-#        loss = loss + criterion:forward(input, output)/batch_l
-#
-#        local drnn_state_attn
-#        local dl_dpred
-        # TODO: opt.guided_alignment
-#        dl_dpred = criterion:backward(input, output)
-#
-#        dl_dpred:div(batch_l)
-#        local dl_dtarget = generator:backward(preds[t], dl_dpred)
+            loss = 0
+            loss_cll = 0
+            for t in reversed(range(target_l)):
+                pred = generator.forward(preds[t])
+                input = pred
+                output = target_out[t]
+                # TODO: opt.guided_alignment
+                loss_nn = criterion.forward(input, output)
+                loss = loss + (loss_nn.data/batch_l)
 
-#        local rnn_state_dec_pred_idx = #drnn_state_dec
-        # TODO: opt.guided_alignment
-#        drnn_state_dec[rnn_state_dec_pred_idx]:add(dl_dtarget)
-#
-#        local decoder_input
-#        if opt.attn == 1 then
-#          decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
-#        else
-#          decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec[t-1])}
-#        end
-#        local dlst = decoder_clones[t]:backward(decoder_input, drnn_state_dec)
-#        # accumulate encoder/decoder grads
-#        if opt.attn == 1 then
-#          encoder_grads:add(dlst[2])
-        # TODO: opt.brnn
-#        else
-#          encoder_grads[{{}, source_l}]:add(dlst[2])
-        # TODO: opt.brnn 
-#        end
+                drnn_state_attn = None
+                dl_dpred = None
+                # TODO: opt.guided_alignment
+                loss_nn.cleargrad()
+                loss_nn.backward(retain_grad=True)
+                dl_dpred = input.grad
 
-#        drnn_state_dec[rnn_state_dec_pred_idx]:zero()
-        # TODO opt.guided_alignment
-#        if opt.input_feed == 1 then
-#          drnn_state_dec[rnn_state_dec_pred_idx]:add(dlst[3])
-#        end
-#        for j = dec_offset, #dlst do
-#          drnn_state_dec[j-dec_offset+1]:copy(dlst[j])
-#        end
-#      end
+                dl_dpred /= batch_l
+                dl_dtarget = preds[t].grad 
+
+                rnn_state_dec_pred_idx = len(drnn_state_dec)
+                # TODO: opt.guided_alignment
+                drnn_state_dec[rnn_state_dec_pred_idx-1] += dl_dtarget
+                
+                decoder_input = None
+                decoder_input = decoder_inputs[t]
+                dlst = [inp.grad for inp in decoder_input]
+                # accumulate encoder/decoder grads
+                if opt.attn == 1:
+                    encoder_grads.add(dlst[1])
+                # TODO: opt.brnn
+                else:
+                    encoder_grads[:, source_l-1] += dlst[1]
+                # TODO: opt.brnn 
+
+                drnn_state_dec[rnn_state_dec_pred_idx-1].fill(0)
+                # TODO opt.guided_alignment
+                if opt.input_feed == 1:
+                    drnn_state_dec[rnn_state_dec_pred_idx-1] += dlst[2]
+                for j in range(dec_offset-1, len(dlst)):
+                    drnn_state_dec[j-dec_offset+1] = dlst[j]
+            print 'end of decoder backprop'
 #      word_vec_layers[2].gradWeight[1]:zero()
     # TODO: opt.fix_word_vecs_dec 
 #      grad_norm = 0
@@ -794,7 +892,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
 #      grad_norm = grad_norm + grad_params[1]:norm()^2
     # TODO: opt.brnn
 #      grad_norm = grad_norm^0.5
-#      -- Shrink norm and update params
+#      # Shrink norm and update params
 #      local param_norm = 0
 #      local shrinkage = opt.max_grad_norm / grad_norm
 #      for j = 1, #grad_params do
@@ -850,7 +948,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder):
     # TODO: opt.guided_alignment
 #    return train_loss, train_nonzeros
 
-    print 'here'
     for epoch in range(opt.start_epoch, opt.epochs): 
         #generator:training()
         # TODO: opt.num_shards
@@ -933,11 +1030,11 @@ def main():
     if len(opt.train_from) == 0:
         encoder = make_lstm(valid_data, opt, 'enc', opt.use_chars_enc)
         decoder = make_lstm(valid_data, opt, 'dec', opt.use_chars_dec)
-        generator = None
+        generator = Generator(valid_data, opt)
 #        generator, criterion = make_generator(valid_data, opt)
         # TODO: Implement opt.brnn
-    # TODO: Implement loading a pre-trained model
 
+    # TODO: Implement loading a pre-trained model
     # TODO: implement opt.guided_alignment
  
     layers = [encoder, decoder, generator]
@@ -952,7 +1049,7 @@ def main():
 #   encoder:apply(get_layer)
 #   decoder:apply(get_layer)
     # TODO: implement opt.brnn
-    train(train_data, valid_data, opt, layers, encoder, decoder)
+    train(train_data, valid_data, opt, layers, encoder, decoder, generator, Criterion())
     
     
     train_data, valid_data, test_data = get_ordering_dataset()
