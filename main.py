@@ -26,6 +26,7 @@ import time
 import os
 from chainer.initializers import Uniform
 from chainer import Variable
+import math
 
 # 
 # Manages encoder/decoder data matrices.
@@ -531,6 +532,7 @@ class Criterion(Chain):
     def forward(self, input, output):
         # w = np.ones(self.data.target_size)
         # w[0] = 0
+        count = input.shape[0]
         return F.softmax_cross_entropy(input, output, normalize=False,class_weight=self.w)
 
 class Generator(Chain):
@@ -787,7 +789,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 output = target_out[t]
                 # TODO: opt.guided_alignment
                 loss_nn = criterion.forward(input, output)
-                loss = loss + (loss_nn.data/batch_l)
+                loss = loss + (loss_nn.data)
 
                 drnn_state_attn = None
                 dl_dpred = None
@@ -869,54 +871,32 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             # Shrink norm and update params
             param_norm = 0
             shrinkage = opt.max_grad_norm / grad_norm
-            print 'done'
-            for j in range(len(grad_params)): 
-               # TODO: gpu 
-
-        if shrinkage < 1 then
-          grad_params[j]:mul(shrinkage)
-        end
-        if opt.optim == 'adagrad' then
-          adagrad_step(params[j], grad_params[j], layer_etas[j], optStates[j])
-        elseif opt.optim == 'adadelta' then
-          adadelta_step(params[j], grad_params[j], layer_etas[j], optStates[j])
-        elseif opt.optim == 'adam' then
-          adam_step(params[j], grad_params[j], layer_etas[j], optStates[j])
-        else
-          params[j]:add(grad_params[j]:mul(-opt.learning_rate))
-        end
-        param_norm = param_norm + params[j]:norm()^2
-############ END OF SHRINKAGE LOOP
-#      param_norm = param_norm^0.5
-    # TODO: opt.brnn
-#      # Bookkeeping
-#      num_words_target = num_words_target + batch_l*target_l
-#      num_words_source = num_words_source + batch_l*source_l
-#      train_nonzeros = train_nonzeros + nonzeros
-#      train_loss = train_loss + loss*batch_l
-    # TODO: opt.guided_alignment
-#      local time_taken = timer:time().real - start_time
-#      if i % opt.print_every == 0 then
-#        local stats = string.format('Epoch: %d, Batch: %d/%d, Batch size: %d, LR: %.4f, ',
-#          epoch, i, data:size(), batch_l, opt.learning_rate)
-#        if opt.guided_alignment == 1 then
-#          stats = stats .. string.format('PPL: %.2f, PPL_CLL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
-#            math.exp(train_loss/train_nonzeros), math.exp(train_loss_cll/train_nonzeros), param_norm, grad_norm)
-#        else
-#          stats = stats .. string.format('PPL: %.2f, |Param|: %.2f, |GParam|: %.2f, ',
-#            math.exp(train_loss/train_nonzeros), param_norm, grad_norm)
-#        end
-#        stats = stats .. string.format('Training: %d/%d/%d total/source/target tokens/sec',
-#          (num_words_target+num_words_source) / time_taken,
-#          num_words_source / time_taken,
-#          num_words_target / time_taken)
-#        print(stats)
-#      end
-    # TODO: do we need collect garbage?
-#    end
-############################## end of for
-    # TODO: opt.guided_alignment
-#    return train_loss, train_nonzeros
+            for j in range(len(params)): 
+                for p in params[j]:
+                   # TODO: gpu 
+                    if shrinkage < 1:
+                        p.grad *= shrinkage
+                    # TODO Handle non SGD optimizers
+                    p.data += (p.grad * -opt.learning_rate)
+                    param_norm = param_norm + (np.linalg.norm(p.data) ** 2)
+            param_norm = param_norm**0.5
+            # TODO: opt.brnn
+            # Bookkeeping
+            num_words_target = num_words_target + batch_l*target_l
+            num_words_source = num_words_source + batch_l*source_l
+            train_nonzeros = train_nonzeros + nonzeros
+            train_loss = train_loss + loss*batch_l
+            # TODO: opt.guided_alignment
+            time_taken = time.time() - start_time
+            if (i % opt.print_every) == 0: 
+                stats = 'Epoch: %d, Batch: %d/%d, Batch size: %d, LR: %.4f, ' % (epoch, i, data.size(), batch_l, opt.learning_rate)
+                # TODO: guided_alignment
+                stats = stats + 'PPL: %.2f, |Param|: %.2f, |GParam|: %.2f, ' % (math.exp(train_loss/train_nonzeros), param_norm, grad_norm)
+                stats = stats + 'Training: %d/%d/%d total/source/target tokens/sec' % ((num_words_target+num_words_source) / time_taken, num_words_source / time_taken, num_words_target / time_taken)
+                print(stats)
+            # TODO: do we need collect garbage?
+            # TODO: opt.guided_alignment
+        return train_loss, train_nonzeros
 
     for epoch in range(opt.start_epoch, opt.epochs): 
         #generator:training()
