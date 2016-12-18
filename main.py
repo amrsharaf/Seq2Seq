@@ -31,43 +31,10 @@ from chainer import Variable
 # Manages encoder/decoder data matrices.
 #
 class Data():
-# function features_on_gpu(features)
-#   local clone = {}
-#   for i = 1,#features do
-#     table.insert(clone, {})
-#     for j = 1,#features[i] do
-#       table.insert(clone[i], features[i][j]:cuda())
-#     end
-#   end
-#   return clone
-# end
-# 
-# -- using the sentences id, build the alignment tensor
-# function generate_aligns(batch_sent_idx, alignment_cc_colidx, alignment_cc_val, source_l, target_l, opt_start_symbol)
-#   if batch_sent_idx == nil then
-#     return nil
-#   end
-#   local batch_size = batch_sent_idx:size(1)
-# 
-#   local src_offset = 0
-#   if opt_start_symbol == 0 then
-#     src_offset = 1
-#   end
-# 
-#   t = torch.Tensor(batch_size, source_l, target_l)
-#   for k = 1, batch_size do
-#     local sent_idx=batch_sent_idx[k]
-#     for i = 0, source_l-1 do
-#       t[k][i+1]:copy(alignment_cc_val:narrow(1, alignment_cc_colidx[sent_idx+1+i+src_offset]+1, target_l))
-#     end
-#   end
-# 
-#   return t
-# end
-# 
-# local data = torch.class("data")
-# 
-# 
+
+    # TODO: features_on_gpu
+    # TODO: generate_aligns
+
     def size(self):
         return self.length
  
@@ -152,7 +119,7 @@ class Data():
             # TODO: Implement source features
 
             # convert table of timesteps per feature to a table of features per timestep
-            source_features_i = self.features_per_timestep(source_feats)
+            source_features_i = None
  
             alignment_i = None
             # TODO: Implement guided alignment
@@ -160,11 +127,8 @@ class Data():
             self.batches.append([target_i, target_output_i.T, self.target_nonzeros[i], source_i, self.batch_l[i], self.target_l[i], self.source_l[i], target_l_i, source_features_i, alignment_i])
         return
     
-    def features_per_timestep(self, features):
-        # TODO: Implement this
-      return None
+    # TODO: features_per_timestep
 
-    
 def parse_arguments():
     ap = ArgumentParser()
     # data files
@@ -560,14 +524,14 @@ class Decoder(Chain):
 
 class Criterion(Chain):
     
+    def __init__(self, vocab_size):
+        self.w = np.ones(vocab_size)
+        self.w[1] = 0
+        
     def forward(self, input, output):
         # w = np.ones(self.data.target_size)
         # w[0] = 0
-#        mask = output == 1
-#        output[mask] = -1
-        count = input.shape[0]
-#        return F.softmax_cross_entropy(input, output, normalize=False) * count
-        return F.softmax_cross_entropy(input, output, normalize=False)
+        return F.softmax_cross_entropy(input, output, normalize=False,class_weight=self.w)
 
 class Generator(Chain):
     
@@ -747,15 +711,21 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             # TODO: opt.gpuid 
             rnn_state_enc = reset_state(init_fwd_enc, batch_l, -1)
             context = context_proto[0:batch_l, 0:source_l]
+            
             # forward prop encoder
+            encoder_inputs = []
             for t in range(source_l):
                 print 'source_l'
                 # TODO: set training to True, this is important for dropout
 #                encoder_clones[t]:training()
-                encoder_input = [source[t]]
+                encoder_input = [Variable(source[t])]
                 # TODO: data.num_source_features
                 # TODO: Is the index here correct?
                 encoder_input += rnn_state_enc[t-1]
+                if t == 0:
+                    for e in range(1, len(encoder_input)):
+                        encoder_input[e] = Variable(encoder_input[e])
+                encoder_inputs.append(encoder_input)
                 out = encoder_clones[t].forward(encoder_input)
 #                c = g.build_computational_graph(out)
 #                with open('graph.dot', 'w') as writer:
@@ -833,7 +803,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 # TODO: opt.guided_alignment
                 drnn_state_dec[rnn_state_dec_pred_idx-1] += dl_dtarget
                 
-                decoder_input = None
                 decoder_input = decoder_inputs[t]
                 dlst = [inp.grad for inp in decoder_input]
                 # accumulate encoder/decoder grads
@@ -863,69 +832,61 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 p_all = np.concatenate((p_all, p.grad.flatten()))
             grad_norm += np.linalg.norm(p_all)**2       
             print grad_norm
-            print 'done'
 #            grad_norm += grad_params[1].norm()^2 + grad_params[2].norm()^2
 
             # backward prop encoder
             # TODO: opt.gpuid  opt.gpuid2 
-#      local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
-#      if opt.init_dec == 1 then
-#        for L = 1, opt.num_layers do
-#          drnn_state_enc[L*2-1]:copy(drnn_state_dec[L*2-1])
-#          drnn_state_enc[L*2]:copy(drnn_state_dec[L*2])
-#        end
-#      end
-#
-#      for t = source_l, 1, -1 do
-#        local encoder_input = {source[t]}
-        # TODO: num_source_features
-#        append_table(encoder_input, rnn_state_enc[t-1])
-#        if opt.attn == 1 then
-#          drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
-#        else
-#          if t == source_l then
-#            drnn_state_enc[#drnn_state_enc]:add(encoder_grads[{{},t}])
-#          end
-#        end
-#        local dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
-#        for j = 1, #drnn_state_enc do
-#          drnn_state_enc[j]:copy(dlst[j+1+data.num_source_features])
-#        end
-#      end
-#
-        # TODO: opt.brnn 
-#
-#      word_vec_layers[1].gradWeight[1]:zero()
-    # TODO: opt.fix_word_vecs_enc
-#      
-#      grad_norm = grad_norm + grad_params[1]:norm()^2
-    # TODO: opt.brnn
-#      grad_norm = grad_norm^0.5
-#      # Shrink norm and update params
-#      local param_norm = 0
-#      local shrinkage = opt.max_grad_norm / grad_norm
-#      for j = 1, #grad_params do
-#        if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
-#          if j == 1 then
-#            cutorch.setDevice(opt.gpuid)
-#          else
-#            cutorch.setDevice(opt.gpuid2)
-#          end
-#        end
-#        if shrinkage < 1 then
-#          grad_params[j]:mul(shrinkage)
-#        end
-#        if opt.optim == 'adagrad' then
-#          adagrad_step(params[j], grad_params[j], layer_etas[j], optStates[j])
-#        elseif opt.optim == 'adadelta' then
-#          adadelta_step(params[j], grad_params[j], layer_etas[j], optStates[j])
-#        elseif opt.optim == 'adam' then
-#          adam_step(params[j], grad_params[j], layer_etas[j], optStates[j])
-#        else
-#          params[j]:add(grad_params[j]:mul(-opt.learning_rate))
-#        end
-#        param_norm = param_norm + params[j]:norm()^2
-#      end
+            drnn_state_enc = reset_state(init_bwd_enc, batch_l)
+            if opt.init_dec == 1:
+                for L in range(opt.num_layers):
+                    drnn_state_enc[2*L] = drnn_state_dec[2 * L]
+                    drnn_state_enc[2*L+1] = drnn_state_dec[2*L+1]
+
+            for t in reversed(range(source_l)):
+                encoder_input = [source[t]]
+                # TODO: num_source_features
+                encoder_input += rnn_state_enc[t-1]
+                if opt.attn == 1:
+                    drnn_state_enc[len(drnn_state_enc) - 1] += encoder_grads[:,t]
+                else:
+                  if t == source_l - 1:
+                      drnn_state_enc[len(drnn_state_enc) - 1] += encoder_grads[:,t]
+                encoder_input = encoder_inputs[t]
+                dlst = [inp.grad for inp in decoder_input]
+#                dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
+                for j in range(len(drnn_state_enc)): 
+                    drnn_state_enc[j] = dlst[j+1+data.num_source_features]
+
+            # TODO: opt.brnn 
+            # TODO: opt.fix_word_vecs_enc
+            p_all = []
+            for p in params[0]:
+                p_all = np.concatenate((p_all, p.grad.flatten()))
+            grad_norm += np.linalg.norm(p_all)**2       
+            print grad_norm
+            # TODO: opt.brnn
+            grad_norm = grad_norm**0.5
+            # Shrink norm and update params
+            param_norm = 0
+            shrinkage = opt.max_grad_norm / grad_norm
+            print 'done'
+            for j in range(len(grad_params)): 
+               # TODO: gpu 
+
+        if shrinkage < 1 then
+          grad_params[j]:mul(shrinkage)
+        end
+        if opt.optim == 'adagrad' then
+          adagrad_step(params[j], grad_params[j], layer_etas[j], optStates[j])
+        elseif opt.optim == 'adadelta' then
+          adadelta_step(params[j], grad_params[j], layer_etas[j], optStates[j])
+        elseif opt.optim == 'adam' then
+          adam_step(params[j], grad_params[j], layer_etas[j], optStates[j])
+        else
+          params[j]:add(grad_params[j]:mul(-opt.learning_rate))
+        end
+        param_norm = param_norm + params[j]:norm()^2
+############ END OF SHRINKAGE LOOP
 #      param_norm = param_norm^0.5
     # TODO: opt.brnn
 #      # Bookkeeping
@@ -1019,7 +980,6 @@ def main():
         exit(0)
 
     valid_data = Data(opt, opt.val_data_file)
-    print 'done!'
 #   print(string.format('Source vocab size: %d, Target vocab size: %d',
 #       valid_data.source_size, valid_data.target_size))
     opt.max_sent_l_src = valid_data.source.shape[1]
@@ -1058,7 +1018,7 @@ def main():
 #   encoder:apply(get_layer)
 #   decoder:apply(get_layer)
     # TODO: implement opt.brnn
-    train(train_data, valid_data, opt, layers, encoder, decoder, generator, Criterion())
+    train(train_data, valid_data, opt, layers, encoder, decoder, generator, Criterion(valid_data.target_size))
     
     
     train_data, valid_data, test_data = get_ordering_dataset()
