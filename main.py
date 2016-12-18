@@ -337,7 +337,6 @@ class Encoder(Chain):
         all_input_sums = i2h + h2h
            
         reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
-#        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
         n1 = reshaped[:, 0, :]
         n2 = reshaped[:, 1, :] 
         n3 = reshaped[:, 2, :] 
@@ -451,7 +450,10 @@ class Decoder(Chain):
         all_input_sums = i2h + h2h
            
         reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
-        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
+        n1 = reshaped[:, 0, :]
+        n2 = reshaped[:, 1, :] 
+        n3 = reshaped[:, 2, :] 
+        n4 = reshaped[:, 3, :] 
         # decode the gates
         in_gate = F.sigmoid(n1)
         forget_gate = F.sigmoid(n2)
@@ -459,9 +461,9 @@ class Decoder(Chain):
         # decode the write inputs
         in_transform = F.tanh(n4)
         # perform the LSTM update
-        next_c = F.squeeze(F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
+        next_c = (forget_gate * prev_c) + (in_gate * in_transform)
         # gated cells form the output
-        next_h = F.squeeze(out_gate) * F.tanh(next_c)
+        next_h = out_gate * F.tanh(next_c)
           
         outputs.append(next_c)
         outputs.append(next_h)
@@ -485,7 +487,10 @@ class Decoder(Chain):
         all_input_sums = i2h + h2h
            
         reshaped = F.reshape(all_input_sums, (x.shape[0], 4, rnn_size))
-        n1, n2, n3, n4 = F.split_axis(reshaped, 4, axis=1) 
+        n1 = reshaped[:, 0, :]  
+        n2 = reshaped[:, 1, :] 
+        n3 = reshaped[:, 2, :] 
+        n4 = reshaped[:, 3, :]
         # decode the gates
         in_gate = F.sigmoid(n1)
         forget_gate = F.sigmoid(n2)
@@ -493,9 +498,9 @@ class Decoder(Chain):
         # decode the write inputs
         in_transform = F.tanh(n4)
         # perform the LSTM update
-        next_c = F.squeeze(F.squeeze(forget_gate) * prev_c) + F.squeeze(in_gate * in_transform)
+        next_c = (forget_gate * prev_c) + (in_gate * in_transform)
         # gated cells form the output
-        next_h = F.squeeze(out_gate) * F.tanh(next_c)
+        next_h = out_gate * F.tanh(next_c)
           
         outputs.append(next_c)
         outputs.append(next_h)
@@ -506,11 +511,8 @@ class Decoder(Chain):
         if self.opt.attn == 1:
             decoder_attn = make_decoder_attn(data, self.opt)
             decoder_attn.name = 'decoder_attn'
-            if opt.guided_alignment == 1:
-                # TODO Implement the attention function
-                decoder_out, attn_output = F.split_axis(decoder_attn({top_h, inputs[2]}), 2)
-            else:
-                decoder_out = decoder_attn({top_h, inputs[2]})
+            # TODO opt.guided_alignment
+            decoder_out = decoder_attn({top_h, inputs[2]})
         else:
             # TODO: Fix indices
             decoder_out = F.concat((top_h, inputs[1]))
@@ -745,8 +747,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
         num_words_target = 0
         num_words_source = 0
 
-        for i in range(1):
-#        for i in range(data.length):
+        for i in range(data.length):
             # TODO: zero grads?
             for e in encoder_clones:
                 e.cleargrads()
@@ -823,6 +824,11 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                         decoder_input[2] = Variable(decoder_input[2])
                 decoder_inputs.append(decoder_input)
                 out = decoder_clones[t].forward(decoder_input)
+#                c = g.build_computational_graph(out)
+#                with open('decoder.dot', 'w') as writer:
+#                    writer.write(c.dump())
+#                os.system('/usr/local/bin/dot -Tpdf decoder.dot > decoder.pdf')
+#                os.system('open decoder.pdf')
                 out_pred_idx = len(out)
                 # TODO: opt.guided_alignment 
                 next_state = []
@@ -847,15 +853,11 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 # TODO: opt.guided_alignment
                 loss_nn = criterion.forward(input, output)
                 loss = loss + (loss_nn.data)
-                print loss
                 drnn_state_attn = None
-                dl_dpred = None
                 # TODO: opt.guided_alignment
                 loss_nn.cleargrad()
                 loss_nn.backward(retain_grad=True)
-                dl_dpred = input.grad
 
-                dl_dpred /= batch_l
                 dl_dtarget = preds[t].grad 
 
                 rnn_state_dec_pred_idx = len(drnn_state_dec)
