@@ -767,7 +767,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             alignment = d[9]
             norm_alignment = None
             # TODO: opt.guided_alignment
-            encoder_grads = encoder_grad_proto[0:batch_l, 0:source_l]
             encoder_bwd_grads = None
             # TODO: opt.brnn
             # TODO: opt.gpuid 
@@ -775,7 +774,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             context = context_proto[0:batch_l, 0:source_l]
             
             # forward prop encoder
-            encoder_inputs = []
             for t in range(source_l):
                 # TODO: set training to True, this is important for dropout
 #                encoder_clones[t]:training()
@@ -786,7 +784,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 if t == 0:
                     for e in range(1, len(encoder_input)):
                         encoder_input[e] = Variable(encoder_input[e])
-                encoder_inputs.append(encoder_input)
                 out = encoder_clones[t].forward(encoder_input)
 #                c = g.build_computational_graph(out)
 #                with open('graph.dot', 'w') as writer:
@@ -812,7 +809,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             preds = []
             attn_outputs = []
             decoder_input = None
-            decoder_inputs = []
             for t in range(target_l):
                 # TODO: set training parameter for dropout
                 decoder_input = None
@@ -822,7 +818,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                     decoder_input = [Variable(target[t]), Variable(context[:, source_l - 1])] + rnn_state_dec[t-1]
                     if t == 0:
                         decoder_input[2] = Variable(decoder_input[2])
-                decoder_inputs.append(decoder_input)
                 out = decoder_clones[t].forward(decoder_input)
 #                c = g.build_computational_graph(out)
 #                with open('decoder.dot', 'w') as writer:
@@ -840,46 +835,29 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 rnn_state_dec[t] = next_state
 
             # backward prop decoder
-            encoder_grads.fill(0)
             # TODO: opt.brnn
-            drnn_state_dec = reset_state(init_bwd_dec, batch_l)
             # TODO: opt.guided_alignment
             loss = 0
             loss_cll = 0
+            loss_nn = 0
             for t in reversed(range(target_l)):
                 pred = generator.forward(preds[t])
                 input = pred
                 output = target_out[t]
                 # TODO: opt.guided_alignment
-                loss_nn = criterion.forward(input, output)
-                loss = loss + (loss_nn.data)
+                loss_nn += criterion.forward(input, output)
                 drnn_state_attn = None
                 # TODO: opt.guided_alignment
-                loss_nn.cleargrad()
-                loss_nn.backward(retain_grad=True)
+            loss_nn.cleargrad()
+            loss_nn.backward()
 
-                dl_dtarget = preds[t].grad 
-
-                rnn_state_dec_pred_idx = len(drnn_state_dec)
+            loss = loss + (loss_nn.data)
                 # TODO: opt.guided_alignment
-                drnn_state_dec[rnn_state_dec_pred_idx-1] += dl_dtarget
                 
-                decoder_input = decoder_inputs[t]
-                dlst = [inp.grad for inp in decoder_input]
                 # accumulate encoder/decoder grads
-                if opt.attn == 1:
-                    encoder_grads.add(dlst[1])
                 # TODO: opt.brnn
-                else:
-                    encoder_grads[:, source_l-1] += dlst[1]
                 # TODO: opt.brnn 
-
-                drnn_state_dec[rnn_state_dec_pred_idx-1].fill(0)
                 # TODO opt.guided_alignment
-                if opt.input_feed == 1:
-                    drnn_state_dec[rnn_state_dec_pred_idx-1] += dlst[2]
-                for j in range(dec_offset-1, len(dlst)):
-                    drnn_state_dec[j-dec_offset+1] = dlst[j]
             # TODO: word_vec_layers
             # TODO: opt.fix_word_vecs_dec 
             grad_norm = 0
@@ -895,26 +873,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
 
             # backward prop encoder
             # TODO: opt.gpuid  opt.gpuid2 
-            drnn_state_enc = reset_state(init_bwd_enc, batch_l)
-            if opt.init_dec == 1:
-                for L in range(opt.num_layers):
-                    drnn_state_enc[2*L] = drnn_state_dec[2 * L]
-                    drnn_state_enc[2*L+1] = drnn_state_dec[2*L+1]
-
-            for t in reversed(range(source_l)):
-                encoder_input = [source[t]]
-                # TODO: num_source_features
-                encoder_input += rnn_state_enc[t-1]
-                if opt.attn == 1:
-                    drnn_state_enc[len(drnn_state_enc) - 1] += encoder_grads[:,t]
-                else:
-                  if t == source_l - 1:
-                      drnn_state_enc[len(drnn_state_enc) - 1] += encoder_grads[:,t]
-                encoder_input = encoder_inputs[t]
-                dlst = [inp.grad for inp in encoder_input]
-#                dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
-                for j in range(len(drnn_state_enc)): 
-                    drnn_state_enc[j] = dlst[j+1+data.num_source_features]
 
             # TODO: opt.brnn 
             # TODO: opt.fix_word_vecs_enc
