@@ -568,7 +568,7 @@ def reset_state(state, batch_l, t=None):
             u[t].append(state[i][0:batch_l])
         return u
 
-def eval(data, encoder_clone, decoder_clone, generator):
+def eval(data, encoder_clone, decoder_clone, generator, init_fwd_enc, context_proto, init_fwd_dec, opt, criterion):
     # TODO: set these modules for evaluation for dropout
     # TODO: opt.brnn
     nll = 0
@@ -592,7 +592,7 @@ def eval(data, encoder_clone, decoder_clone, generator):
             encoder_input += rnn_state_enc
             out = encoder_clone.forward(encoder_input)
             rnn_state_enc = out
-            context[:,t] = out[-1]
+            context[:,t] = out[-1].data
 
         # TODO: gpu
 
@@ -625,8 +625,8 @@ def eval(data, encoder_clone, decoder_clone, generator):
             input = pred
             output = target_out[t]
             # TODO: opt.guided_alignment
-
-            loss = loss + criterion.forward(input, output)
+            loss = loss + criterion.forward(input, output).data * input.shape[0]
+        print loss
             # TODO: opt.guided_alignment
         nll = nll + loss
         # TODO: opt.guided_alignment
@@ -644,7 +644,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
     params = []
     grad_params = [] 
     opt.train_perf = []
-    opt.val_perf = {}
+    opt.val_perf = []
 
     for i in range(len(layers)):
         # TODO: Implement gpu
@@ -745,7 +745,8 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
         num_words_target = 0
         num_words_source = 0
 
-        for i in range(data.length):
+        for i in range(1):
+#        for i in range(data.length):
             # TODO: zero grads?
             for e in encoder_clones:
                 e.cleargrads()
@@ -758,6 +759,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 d = data[i]
             else:
                 d = data[batch_order[i]]
+#            d = data[20]
             target, target_out, nonzeros, source = d[0], d[1], d[2], d[3]
             batch_l, target_l, source_l = d[4], d[5], d[6]
             source_features = d[8]
@@ -845,7 +847,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 # TODO: opt.guided_alignment
                 loss_nn = criterion.forward(input, output)
                 loss = loss + (loss_nn.data)
-
+                print loss
                 drnn_state_attn = None
                 dl_dpred = None
                 # TODO: opt.guided_alignment
@@ -956,15 +958,16 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
         # TODO: opt.guided_alignment
         total_loss, total_nonzeros = train_batch(train_data, epoch)
         train_score = math.exp(total_loss/total_nonzeros)
-        print 'Train' + train_score
-#        opt.train_perf[#opt.train_perf + 1] = train_score
-#        local score = eval(valid_data)
-#        opt.val_perf[#opt.val_perf + 1] = score
+        print 'Train', train_score
+        opt.train_perf.append(train_score)
+        score = eval(valid_data, encoder, decoder, generator, init_fwd_enc, context_proto, init_fwd_dec,opt, criterion)
+        opt.val_perf.append(score)
+        # TODO: decay
 #        if opt.optim == 'sgd' then --only decay with SGD
 #          decay_lr(epoch)
 #        end
-#       # TODO: opt.guided_alignment 
-#        -- clean and save models
+        # TODO: opt.guided_alignment 
+        # clean and save models
 #        local savefile = string.format('%s_epoch%.2f_%.2f.t7', opt.savefile, epoch, score)
 #        if epoch % opt.save_every == 0 then
 #          print('saving checkpoint to ' .. savefile)
