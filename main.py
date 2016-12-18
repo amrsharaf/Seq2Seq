@@ -563,6 +563,10 @@ class Criterion(Chain):
     def forward(self, input, output):
         # w = np.ones(self.data.target_size)
         # w[0] = 0
+#        mask = output == 1
+#        output[mask] = -1
+        count = input.shape[0]
+#        return F.softmax_cross_entropy(input, output, normalize=False) * count
         return F.softmax_cross_entropy(input, output, normalize=False)
 
 class Generator(Chain):
@@ -579,7 +583,8 @@ class Generator(Chain):
 def clone_many_times(net, T):
     clones = []
     for t in range(T):
-        clone = copy.deepcopy(net)
+        clone = (net)
+#        clone = copy.deepcopy(net)
         clones.append(clone)
     return clones
 
@@ -598,7 +603,7 @@ def reset_state(state, batch_l, t=None):
         return u
 
 def train(train_data, valid_data, opt, layers, encoder, decoder, generator, criterion):
-    timer = None
+    timer = time.time()
     num_params = 0
     start_decay = 0
     params = []
@@ -616,7 +621,8 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
         if len(opt.train_from) == 0:
             for p in params_lst:
                 num_params += p.size 
-                Uniform(scale=opt.param_init)(p.data)
+                p.data.fill(0.05)
+#                Uniform(scale=opt.param_init)(p.data)
 #        grad_params[i] = gp
         # TODO: can we do linear pruning in Chainer?
         
@@ -626,13 +632,12 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
     print 'Number of parameters: ', num_params, ' (active: ', num_params, ')'
 
     # TODO: GPU
-#    word_vec_layers[1].weight[1]:zero()
-#    word_vec_layers[2].weight[1]:zero()
+    # TODO: word_vec_layers
     # TODO: opt.brnn
 
     # prototypes for gradients so there is no need to clone
-    encoder_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
-    encoder_bwd_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size))
+    encoder_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size)).astype(np.float32)
+    encoder_bwd_grad_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size)).astype(np.float32)
     context_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size)).astype(np.float32)
     # TODO: opt.gpuid2
 
@@ -674,19 +679,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
     if opt.input_feed == 1:
         dec_offset = dec_offset + 1
 
-#  # clean layer before saving to make the model smaller
-#  function clean_layer(layer)
-    # TODO: opt.gpuid
-#    layer.output = torch.DoubleTensor()
-#    layer.gradInput = torch.DoubleTensor()
-#    if layer.modules then
-#      for i, mod in ipairs(layer.modules) do
-#        clean_layer(mod)
-#      end
-#    elseif torch.type(self) == "nn.gModule" then
-#      layer:apply(clean_layer)
-#    end
-#  end
+    # TODO: memory cleanup for chainer
 
 #  # decay learning rate if val perf does not improve or we hit the opt.start_decay_at limit
 #  function decay_lr(epoch)
@@ -706,7 +699,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
 #      opt.learning_rate = opt.learning_rate * opt.lr_decay
 #    end
 #  end
-#
+
     def train_batch(data, epoch):
         opt.num_source_features = data.num_source_features
 
@@ -720,7 +713,13 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
 
         for i in range(data.length):
             print i 
-            # TODO zero grads?
+            # TODO: zero grads?
+            for e in encoder_clones:
+                e.cleargrads()
+            for d in decoder_clones:
+                d.cleargrads()
+            for layer in layers:
+                layer.cleargrads()
             # zero_table(grad_params, 'zero')
             if epoch <= opt.curriculum:
                 d = data[i]
@@ -852,13 +851,23 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 for j in range(dec_offset-1, len(dlst)):
                     drnn_state_dec[j-dec_offset+1] = dlst[j]
             print 'end of decoder backprop'
-#      word_vec_layers[2].gradWeight[1]:zero()
-    # TODO: opt.fix_word_vecs_dec 
-#      grad_norm = 0
-#      grad_norm = grad_norm + grad_params[2]:norm()^2 + grad_params[3]:norm()^2
-#
-#      # backward prop encoder
-    # TODO: opt.gpuid  opt.gpuid2 
+            # TODO: word_vec_layers
+            # TODO: opt.fix_word_vecs_dec 
+            grad_norm = 0
+            p_all = np.array([],dtype = np.float32)
+            for p in params[1]:
+                p_all = np.concatenate((p_all, p.grad.flatten()))
+            grad_norm += np.linalg.norm(p_all)**2       
+            p_all = np.array([],dtype = np.float32)
+            for p in params[2]:
+                p_all = np.concatenate((p_all, p.grad.flatten()))
+            grad_norm += np.linalg.norm(p_all)**2       
+            print grad_norm
+            print 'done'
+#            grad_norm += grad_params[1].norm()^2 + grad_params[2].norm()^2
+
+            # backward prop encoder
+            # TODO: opt.gpuid  opt.gpuid2 
 #      local drnn_state_enc = reset_state(init_bwd_enc, batch_l)
 #      if opt.init_dec == 1 then
 #        for L = 1, opt.num_layers do
