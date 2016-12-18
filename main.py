@@ -568,6 +568,75 @@ def reset_state(state, batch_l, t=None):
             u[t].append(state[i][0:batch_l])
         return u
 
+def eval(data, encoder_clone, decoder_clone, generator):
+    # TODO: set these modules for evaluation for dropout
+    # TODO: opt.brnn
+    nll = 0
+    nll_cll = 0
+    total = 0
+    for i in range(data.size()):
+        d = data[i]
+        target, target_out, nonzeros, source = d[0], d[1], d[2], d[3]
+        batch_l, target_l, source_l = d[4], d[5], d[6]
+        source_features = d[8]
+        alignment = d[9]
+        norm_alignment = None
+        # TODO: opt.guided_alignment
+        # TODO: gpu
+        rnn_state_enc = reset_state(init_fwd_enc, batch_l)
+        context = context_proto[0:batch_l, 0:source_l]
+        # forward prop encoder
+        for t in range(source_l):
+            encoder_input = [source[t]]
+            # TODO: data.num_source_features
+            encoder_input += rnn_state_enc
+            out = encoder_clone.forward(encoder_input)
+            rnn_state_enc = out
+            context[:,t] = out[-1]
+
+        # TODO: gpu
+
+        rnn_state_dec = reset_state(init_fwd_dec, batch_l)
+        if opt.init_dec == 1:
+            for L in range(opt.num_layers):
+                rnn_state_dec[2*L + opt.input_feed] = rnn_state_enc[2*L]
+                rnn_state_dec[2*L + opt.input_feed + 1] = rnn_state_enc[2*L+1]
+
+        # TODO: brnn
+
+        loss = 0
+        loss_cll = 0
+        attn_outputs = []
+        for t in range(target_l):
+            # TODO: opt.attn
+            decoder_input = [target[t], context[:,source_l-1]] +  rnn_state_dec
+            out = decoder_clone.forward(decoder_input)
+
+            out_pred_idx = len(out)
+            # TODO: opt.guided_alignment
+
+            rnn_state_dec = []
+            if opt.input_feed == 1:
+                rnn_state_dec.append(out[out_pred_idx-1])
+            for j in range(out_pred_idx-1):
+                rnn_state_dec.append(out[j])
+            pred = generator.forward(out[out_pred_idx-1])
+
+            input = pred
+            output = target_out[t]
+            # TODO: opt.guided_alignment
+
+            loss = loss + criterion.forward(input, output)
+            # TODO: opt.guided_alignment
+        nll = nll + loss
+        # TODO: opt.guided_alignment
+        total = total + nonzeros
+    valid = math.exp(nll / total)
+    print "Valid", valid
+    # TODO: opt.guided_alignment
+    # TODO: collect garbage
+    return valid
+
 def train(train_data, valid_data, opt, layers, encoder, decoder, generator, criterion):
     timer = time.time()
     num_params = 0
@@ -579,7 +648,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
 
     for i in range(len(layers)):
         # TODO: Implement gpu
-        print layers[i]
         params_lst = list(layers[i].params())
         params.append(params_lst)
 #        p, gp = layers[i]:getParameters()
@@ -678,7 +746,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
         num_words_source = 0
 
         for i in range(data.length):
-            print i 
             # TODO: zero grads?
             for e in encoder_clones:
                 e.cleargrads()
@@ -691,20 +758,10 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 d = data[i]
             else:
                 d = data[batch_order[i]]
-            print d
             target, target_out, nonzeros, source = d[0], d[1], d[2], d[3]
-            print 'target: ', target
-            print 'target_out: ', target_out
-            print 'nonzeros: ', nonzeros
-            print 'source: ', source
             batch_l, target_l, source_l = d[4], d[5], d[6]
-            print 'batch_l: ', batch_l
-            print 'target_l: ', target_l
-            print 'source_l: ', source_l
             source_features = d[8]
-            print 'source_features: ', source_features
             alignment = d[9]
-            print 'alignment: ', alignment
             norm_alignment = None
             # TODO: opt.guided_alignment
             encoder_grads = encoder_grad_proto[0:batch_l, 0:source_l]
@@ -717,7 +774,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             # forward prop encoder
             encoder_inputs = []
             for t in range(source_l):
-                print 'source_l'
                 # TODO: set training to True, this is important for dropout
 #                encoder_clones[t]:training()
                 encoder_input = [Variable(source[t])]
@@ -755,7 +811,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             decoder_input = None
             decoder_inputs = []
             for t in range(target_l):
-                print 'target_l'
                 # TODO: set training parameter for dropout
                 decoder_input = None
                 if opt.attn == 1:
@@ -821,7 +876,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                     drnn_state_dec[rnn_state_dec_pred_idx-1] += dlst[2]
                 for j in range(dec_offset-1, len(dlst)):
                     drnn_state_dec[j-dec_offset+1] = dlst[j]
-            print 'end of decoder backprop'
             # TODO: word_vec_layers
             # TODO: opt.fix_word_vecs_dec 
             grad_norm = 0
@@ -833,7 +887,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             for p in params[2]:
                 p_all = np.concatenate((p_all, p.grad.flatten()))
             grad_norm += np.linalg.norm(p_all)**2       
-            print grad_norm
 #            grad_norm += grad_params[1].norm()^2 + grad_params[2].norm()^2
 
             # backward prop encoder
@@ -854,7 +907,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                   if t == source_l - 1:
                       drnn_state_enc[len(drnn_state_enc) - 1] += encoder_grads[:,t]
                 encoder_input = encoder_inputs[t]
-                dlst = [inp.grad for inp in decoder_input]
+                dlst = [inp.grad for inp in encoder_input]
 #                dlst = encoder_clones[t]:backward(encoder_input, drnn_state_enc)
                 for j in range(len(drnn_state_enc)): 
                     drnn_state_enc[j] = dlst[j+1+data.num_source_features]
@@ -865,7 +918,6 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             for p in params[0]:
                 p_all = np.concatenate((p_all, p.grad.flatten()))
             grad_norm += np.linalg.norm(p_all)**2       
-            print grad_norm
             # TODO: opt.brnn
             grad_norm = grad_norm**0.5
             # Shrink norm and update params
@@ -903,8 +955,8 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
         # TODO: opt.num_shards
         # TODO: opt.guided_alignment
         total_loss, total_nonzeros = train_batch(train_data, epoch)
-#        local train_score = math.exp(total_loss/total_nonzeros)
-#        print('Train', train_score)
+        train_score = math.exp(total_loss/total_nonzeros)
+        print 'Train' + train_score
 #        opt.train_perf[#opt.train_perf + 1] = train_score
 #        local score = eval(valid_data)
 #        opt.val_perf[#opt.val_perf + 1] = score
