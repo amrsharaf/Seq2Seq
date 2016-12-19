@@ -27,6 +27,7 @@ import os
 from chainer.initializers import Uniform
 from chainer import Variable
 import math
+import chainer
 
 # 
 # Manages encoder/decoder data matrices.
@@ -470,8 +471,8 @@ class Decoder(Chain):
         # Second LSTM
         nameL = model + '_L' + str(1) + '_'
         # c,h from previous timesteps
-        prev_c = inputs[1*2+1+offset]
-        prev_h = inputs[1*2+2+offset]
+        prev_c = inputs[3+offset]
+        prev_h = inputs[4+offset]
         # the input to this layer
         x = outputs[2 * 1 - 1]
         # TODOi: opt.res_net 
@@ -508,16 +509,10 @@ class Decoder(Chain):
         top_h = outputs[-1]
         decoder_out = None
         attn_output = None
-        if self.opt.attn == 1:
-            decoder_attn = make_decoder_attn(data, self.opt)
-            decoder_attn.name = 'decoder_attn'
-            # TODO opt.guided_alignment
-            decoder_out = decoder_attn({top_h, inputs[2]})
-        else:
-            # TODO: Fix indices
-            decoder_out = F.concat((top_h, inputs[1]))
-#            decoder_out = F.concat((top_h, inputs[1].astype(np.float32)))
-            decoder_out = F.tanh(self.dec_out(decoder_out))
+        # TODO: self.opt.attn
+        # TODO: Fix indices
+        decoder_out = F.concat((top_h, inputs[1]))
+        decoder_out = F.tanh(self.dec_out(decoder_out))
         if dropout > 0:
             # TODO: Fix dropout input
             decoder_out = L.Dropout(dropout, nil, false)
@@ -545,14 +540,13 @@ class Generator(Chain):
         
     def forward(self, x):
         output = self.lin(x)
-        output = F.log_softmax(output)
+#        output = F.log_softmax(output)
         return output
 
 def clone_many_times(net, T):
     clones = []
     for t in range(T):
         clone = (net)
-#        clone = copy.deepcopy(net)
         clones.append(clone)
     return clones
 
@@ -628,7 +622,6 @@ def eval(data, encoder_clone, decoder_clone, generator, init_fwd_enc, context_pr
             output = target_out[t]
             # TODO: opt.guided_alignment
             loss = loss + criterion.forward(input, output).data * input.shape[0]
-        print loss
             # TODO: opt.guided_alignment
         nll = nll + loss
         # TODO: opt.guided_alignment
@@ -647,19 +640,30 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
     grad_params = [] 
     opt.train_perf = []
     opt.val_perf = []
+    encoder_opt = optimizers.SGD(lr=opt.learning_rate)
+    encoder_opt.use_cleargrads()
+    encoder_opt.setup(encoder)
+    decoder_opt = optimizers.SGD(lr=opt.learning_rate)
+    decoder_opt.use_cleargrads()
+    decoder_opt.setup(decoder)
+    generator_opt = optimizers.SGD(lr=opt.learning_rate)
+    generator_opt.use_cleargrads()
+    generator_opt.setup(generator)
+    # hooks
+    encoder_opt.add_hook(chainer.optimizer.GradientClipping(opt.max_grad_norm))
+    decoder_opt.add_hook(chainer.optimizer.GradientClipping(opt.max_grad_norm))
+    generator_opt.add_hook(chainer.optimizer.GradientClipping(opt.max_grad_norm))
 
-    for i in range(len(layers)):
+    for layer in layers:
         # TODO: Implement gpu
-        params_lst = list(layers[i].params())
+        params_lst = list(layer.params())
         params.append(params_lst)
-#        p, gp = layers[i]:getParameters()
         # TOOD: move this to the link initializer
         if len(opt.train_from) == 0:
             for p in params_lst:
                 num_params += p.size 
-                p.data.fill(0.05)
-#                Uniform(scale=opt.param_init)(p.data)
-#        grad_params[i] = gp
+#                p.data.fill(0.05)
+                Uniform(scale=opt.param_init)(p.data)
         # TODO: can we do linear pruning in Chainer?
         
     # TODO: opt.pre_word_vecs_enc
@@ -677,43 +681,28 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
     context_proto = np.zeros((opt.max_batch_l, opt.max_sent_l, opt.rnn_size)).astype(np.float32)
     # TODO: opt.gpuid2
 
-    # clone encoder/decoder up to max source/target length
-    decoder_clones = clone_many_times(decoder, opt.max_sent_l_targ)
-    encoder_clones = clone_many_times(encoder, opt.max_sent_l_src)
     # TODO: opt.brnn
     # TODO: can we do parameter sharing in Chainer like setReuse?
     # TODO: opt.brnn 
     # TODO xp    
     h_init = np.zeros((opt.max_batch_l, opt.rnn_size), dtype = np.float32)
-    attn_init = np.zeros((opt.max_batch_l, opt.max_sent_l))
     # TODO GPU
 
     # these are initial states of encoder/decoder for fwd/bwd steps
     init_fwd_enc = []
-    init_bwd_enc = []
     init_fwd_dec = []
-    init_bwd_dec = []
 
     for L in range(opt.num_layers):
         init_fwd_enc.append(h_init.copy())
         init_fwd_enc.append(h_init.copy())
-        init_bwd_enc.append(h_init.copy())
-        init_bwd_enc.append(h_init.copy())
 
     # TODO: opt.gpuid2
     if opt.input_feed == 1:
         init_fwd_dec.append(h_init.copy())
-    init_bwd_dec.append(h_init.copy())
     # TODO Move this to a separate function
     for L in range(opt.num_layers):
         init_fwd_dec.append(h_init.copy())
         init_fwd_dec.append(h_init.copy())
-        init_bwd_dec.append(h_init.copy())
-        init_bwd_dec.append(h_init.copy())
-
-    dec_offset = 3 # offset depends on input feeding
-    if opt.input_feed == 1:
-        dec_offset = dec_offset + 1
 
     # TODO: memory cleanup for chainer
 
@@ -749,10 +738,14 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
 
         for i in range(data.length):
             # TODO: zero grads?
-            for e in encoder_clones:
-                e.cleargrads()
-            for d in decoder_clones:
-                d.cleargrads()
+            encoder.cleargrads()
+            decoder.cleargrads()
+            generator.cleargrads()
+#            criterion.cleargrads()
+#            for e in encoder_clones:
+#                e.cleargrads()
+#            for d in decoder_clones:
+#                d.cleargrads()
             for layer in layers:
                 layer.cleargrads()
             # zero_table(grad_params, 'zero')
@@ -767,24 +760,20 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             alignment = d[9]
             norm_alignment = None
             # TODO: opt.guided_alignment
-            encoder_bwd_grads = None
             # TODO: opt.brnn
             # TODO: opt.gpuid 
             rnn_state_enc = reset_state(init_fwd_enc, batch_l, -1)
-            context = context_proto[0:batch_l, 0:source_l]
+ #           context = Variable(context_proto[0:batch_l, 0:source_l])
             
             # forward prop encoder
             for t in range(source_l):
                 # TODO: set training to True, this is important for dropout
 #                encoder_clones[t]:training()
-                encoder_input = [Variable(source[t])]
+                encoder_input = [source[t]]
                 # TODO: data.num_source_features
                 # TODO: Is the index here correct?
                 encoder_input += rnn_state_enc[t-1]
-                if t == 0:
-                    for e in range(1, len(encoder_input)):
-                        encoder_input[e] = Variable(encoder_input[e])
-                out = encoder_clones[t].forward(encoder_input)
+                out = encoder.forward(encoder_input)
 #                c = g.build_computational_graph(out)
 #                with open('graph.dot', 'w') as writer:
 #                    writer.write(c.dump())
@@ -792,16 +781,15 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
 #                os.system('open graph.pdf')
                 rnn_state_enc[t] = out
                 # TODO: why do we need copy here?
-                context[:,t] = out[len(out) - 1].data
+#                context[:,t] = out[-1]
+                context = out[-1]
 
-            rnn_state_enc_bwd = None
             # TODO opt.brnn
             # TODO: opt.gpuid opt.gpuid2
             # copy encoder last hidden state to decoder initial state
             rnn_state_dec = reset_state(init_fwd_dec, batch_l, -1)
             if opt.init_dec == 1:
                 for L in range(opt.num_layers):
-                    # TODO: do we need to copy?
                     rnn_state_dec[-1][2 * L + opt.input_feed] = rnn_state_enc[source_l - 1][2 * L]
                     rnn_state_dec[-1][2 * L + opt.input_feed + 1] = rnn_state_enc[source_l - 1][ 2 * L+ 1]
             # TODO: opt.brnn
@@ -811,19 +799,14 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             decoder_input = None
             for t in range(target_l):
                 # TODO: set training parameter for dropout
-                decoder_input = None
-                if opt.attn == 1:
-                    decoder_input = [target[t], context] + rnn_state_dec[t-1]
-                else:
-                    decoder_input = [Variable(target[t]), Variable(context[:, source_l - 1])] + rnn_state_dec[t-1]
-                    if t == 0:
-                        decoder_input[2] = Variable(decoder_input[2])
-                out = decoder_clones[t].forward(decoder_input)
+                # TODO: opt.attn
+                decoder_input = [target[t], context] + rnn_state_dec[t-1]
+                out = decoder.forward(decoder_input)
 #                c = g.build_computational_graph(out)
 #                with open('decoder.dot', 'w') as writer:
 #                    writer.write(c.dump())
-#                os.system('/usr/local/bin/dot -Tpdf decoder.dot > decoder.pdf')
-#                os.system('open decoder.pdf')
+#                os.system('/usr/local/bin/dot -Tpdf decoder.dot > decoder_2.pdf')
+#                os.system('open decoder_2.pdf')
                 out_pred_idx = len(out)
                 # TODO: opt.guided_alignment 
                 next_state = []
@@ -846,14 +829,13 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
                 output = target_out[t]
                 # TODO: opt.guided_alignment
                 loss_nn += criterion.forward(input, output)
-                drnn_state_attn = None
                 # TODO: opt.guided_alignment
             loss_nn.cleargrad()
             loss_nn.backward()
+            loss_nn.unchain_backward()
 
             loss = loss + (loss_nn.data)
                 # TODO: opt.guided_alignment
-                
                 # accumulate encoder/decoder grads
                 # TODO: opt.brnn
                 # TODO: opt.brnn 
@@ -869,9 +851,7 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             for p in params[2]:
                 p_all = np.concatenate((p_all, p.grad.flatten()))
             grad_norm += np.linalg.norm(p_all)**2       
-#            grad_norm += grad_params[1].norm()^2 + grad_params[2].norm()^2
 
-            # backward prop encoder
             # TODO: opt.gpuid  opt.gpuid2 
 
             # TODO: opt.brnn 
@@ -884,15 +864,19 @@ def train(train_data, valid_data, opt, layers, encoder, decoder, generator, crit
             grad_norm = grad_norm**0.5
             # Shrink norm and update params
             param_norm = 0
-            shrinkage = opt.max_grad_norm / grad_norm
-            for j in range(len(params)): 
-                for p in params[j]:
-                   # TODO: gpu 
-                    if shrinkage < 1:
-                        p.grad *= shrinkage
-                    # TODO Handle non SGD optimizers
-                    p.data += (p.grad * -opt.learning_rate)
-                    param_norm = param_norm + (np.linalg.norm(p.data) ** 2)
+#            shrinkage = opt.max_grad_norm / grad_norm
+#            print shrinkage
+#            for j in range(len(params)): 
+#                for p in params[j]:
+#                   # TODO: gpu 
+#                    if shrinkage < 1:
+#                        p.grad *= shrinkage
+#                    # TODO Handle non SGD optimizers
+#                    p.data += (p.grad * -opt.learning_rate)
+#                    param_norm = param_norm + (np.linalg.norm(p.data) ** 2)
+            encoder_opt.update()
+            decoder_opt.update()
+            generator_opt.update()
             param_norm = param_norm**0.5
             # TODO: opt.brnn
             # Bookkeeping
